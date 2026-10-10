@@ -573,9 +573,29 @@ def test_a_test_or_token_row_still_holds_in_its_currency(price, currency):
     assert "placeholder_product" in rules(flags, detectors.BLOCK)
 
 
-def test_the_magnitude_is_a_unit_not_a_rate():
-    assert detectors.price_magnitude("JPY") == 100.0 and detectors.price_magnitude("jpy") == 100.0
-    assert detectors.price_magnitude("SGD") == 1.0 and detectors.price_magnitude(None) == 1.0
+@pytest.mark.parametrize("currency,scale", [
+    ("JPY", 100.0), ("jpy", 100.0), ("KRW", 1000.0), ("HKD", 5.0), ("CNY", 5.0), ("TWD", 30.0), ("THB", 30.0),
+    ("PHP", 50.0), ("INR", 50.0), ("IDR", 10000.0), ("VND", 20000.0), ("MYR", 4.0), ("SEK", 10.0), ("NOK", 10.0),
+    ("DKK", 5.0), ("MXN", 15.0), ("ZAR", 15.0),
+    ("USD", 1.0), ("SGD", 1.0), ("AUD", 1.0), ("EUR", 1.0), ("GBP", 1.0), ("CAD", 1.0), (None, 1.0), ("", 1.0)])
+def test_the_magnitude_is_a_unit_not_a_rate(currency, scale):
+    assert detectors.price_magnitude(currency) == scale
+
+
+def test_a_one_yen_sample_variant_beside_a_real_price_holds_the_row():
+    # The feed's sellable floor is 1.0 in the store's currency: it drops a $0.01 promo, but keeps a 1-yen one.
+    rec = record("Sekkisei Lotion 200ml", "Lotion", "sekkisei-lotion", body="<p>A lotion for the face.</p>",
+                 vendor="KOSE", brand="KOSE", currency="JPY",
+                 variants=[{"id": 44_100_000_001, "price": "5500", "available": True, "title": "200ml"},
+                           {"id": 44_100_000_002, "price": "1", "available": True, "title": "Sample"}])
+    assert "placeholder_product" in rules(detectors.detect([rec], store_level=False), detectors.BLOCK)
+
+
+def test_a_dollar_row_is_untouched_by_the_variant_low_bound():
+    rec = record("Lip Oil", "Lip Oil", "lip-oil", variants=[
+        {"id": 44_100_000_011, "price": "38.00", "available": True, "title": "Rose"},
+        {"id": 44_100_000_012, "price": "0.01", "available": True, "title": "Promo"}])  # the feed drops the $0.01 variant
+    assert "placeholder_product" not in rules(detectors.detect([rec], store_level=False))
 
 
 def test_a_yen_store_priced_at_a_token_still_holds_store_wide():
@@ -584,6 +604,32 @@ def test_a_yen_store_priced_at_a_token_still_holds_store_wide():
     assert held == {f"p{i}" for i in range(40)}
 
 
+def _yen(n, start=1980):
+    return [float(start + 110 * i) for i in range(n)]  # whole yen, as a JPY store prices
+
+
 def test_a_real_yen_store_holds_nothing():
-    flags = detectors.detect(store([[v] for v in _varied(60, 1980.0)], domain="example.jp", currency="JPY"))
+    flags = detectors.detect(store([[v] for v in _yen(60)], domain="example.jp", currency="JPY"))
     assert _held(flags) == set() and "placeholder_product" not in rules(flags)
+
+
+def test_the_yen_token_path_alone_holds():
+    # 21/60 = 0.35 at <= 100 yen (the scaled 1.00 token), the rest real and varied: no mode reaches 0.80, so only
+    # the token path can hold -- it pins the scaled token price AND the scaled ceiling it appends.
+    recs = store([[100.0]] * 21 + [[v] for v in _yen(39)], domain="example.jp", currency="JPY")
+    assert _held(detectors.detect(recs)) == {f"p{i}" for i in range(21)}
+
+
+def test_the_yen_modal_path_alone_holds():
+    # 43/50 = 0.86 at 150 yen: above the 100-yen token, at or below the 200-yen modal ceiling.
+    recs = store([[150.0]] * 43 + [[v] for v in _yen(7)], domain="example.jp", currency="JPY")
+    assert _held(detectors.detect(recs)) == {f"p{i}" for i in range(43)}
+
+
+def test_a_mixed_currency_population_takes_the_largest_scale():
+    # Unreachable through the pipeline (it stops a job whose records disagree on currency), but the verdict
+    # must be deterministic and fail safe: yen tokens judged on the yen scale, whatever the set order.
+    recs = (store([[100.0]] * 30, domain="example.jp", currency="JPY")
+            + store([[v] for v in _varied(10, 30.0)], domain="example.com", currency="USD"))
+    verdict = detectors.placeholder_price_store_verdict(recs)
+    assert verdict is not None and verdict["ceiling"] >= 100.0

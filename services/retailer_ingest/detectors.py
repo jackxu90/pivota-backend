@@ -138,10 +138,13 @@ def _handle(record: Dict[str, Any]) -> Optional[str]:
 # against the dollar. This is a coarse unit, not FX: no price is converted, compared across currencies or
 # written; a 10x margin either way still separates a token or a test row from a real price list. A currency
 # not listed (or none) keeps the dollar bounds, exactly today's behaviour.
+# Each value sits at or BELOW the currency's usual rate to the dollar, so a scaled upper bound holds a little
+# earlier than in dollars (fails safe) and a scaled token bound never reaches a common real price point (CNY's
+# 9.9 trial size sits under no token bound at 5).
 _PRICE_MAGNITUDE = {
-    "JPY": 100.0, "KRW": 1000.0, "HKD": 10.0, "CNY": 10.0, "TWD": 30.0, "THB": 30.0, "PHP": 50.0,
-    "INR": 100.0, "IDR": 10000.0, "VND": 10000.0, "MYR": 5.0, "SEK": 10.0, "NOK": 10.0, "DKK": 10.0,
-    "MXN": 20.0, "ZAR": 20.0,
+    "JPY": 100.0, "KRW": 1000.0, "HKD": 5.0, "CNY": 5.0, "TWD": 30.0, "THB": 30.0, "PHP": 50.0,
+    "INR": 50.0, "IDR": 10000.0, "VND": 20000.0, "MYR": 4.0, "SEK": 10.0, "NOK": 10.0, "DKK": 5.0,
+    "MXN": 15.0, "ZAR": 15.0,
 }
 
 
@@ -188,9 +191,10 @@ def placeholder_price_store_verdict(population: Iterable[Dict[str, Any]]) -> Opt
     population = [record for record in population or [] if _pdp(record)]
     every = [p for record in population for p in _variant_prices(record)]
     total = len(every)
-    # One storefront prices in one currency (its /meta.json); the most common one decides the scale.
-    currencies = [_currency(record) for record in population]
-    scale = price_magnitude(max(set(currencies), key=currencies.count) if currencies else None)
+    # One storefront prices in one currency (its /meta.json; the pipeline stops a job whose records disagree).
+    # Should a population ever mix currencies, take the LARGEST scale present: deterministic, and it fails
+    # safe -- a larger token bound holds more, never fewer.
+    scale = max((price_magnitude(_currency(record)) for record in population), default=1.0)
     token_price, modal_ceiling = _STORE_TOKEN_PRICE * scale, _STORE_MODAL_CEILING * scale
     if total < _STORE_MIN_VARIANTS:
         return None
@@ -380,8 +384,13 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
         prices = _prices(record)
         vendor = str(pdp.get("brand") or "")
         scale = price_magnitude(_currency(record))
+        # The low bound also reads every VARIANT price: the feed's sellable floor (MIN_SELLABLE_PRICE = 1.0 in
+        # the store's currency) drops a $0.01 promo variant in dollars, but in yen it is 1 yen, so a 1-yen
+        # "free sample" variant survives into pdp.variants while the offer carries the real price (review of
+        # this change, 2026-10-10). In dollars nothing changes: no variant under $1 reaches a record.
         if (_PLACEHOLDER.search(title) or re.search(r"\bdev\b", vendor, re.I)
-                or any(p <= 0.5 * scale or p >= 1000 * scale for p in prices)):
+                or any(p <= 0.5 * scale or p >= 1000 * scale for p in prices)
+                or any(p <= 0.5 * scale for p in _variant_prices(record))):
             flags.append(_flag("placeholder_product", BLOCK, record,
                                f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]})"))
     if store_level:
