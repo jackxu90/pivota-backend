@@ -1296,6 +1296,64 @@ async def test_a_purchase_opens_and_the_response_says_so(client):
     assert row["agent_user_ref_hash"] == hash_agent_user_ref(USER_REF)
 
 
+async def _agent_purchase_parents(purchase_id: str) -> list:
+    return [
+        dict(r) for r in await database.fetch_all(
+            "SELECT * FROM agent_purchases WHERE rail = 'reap' AND rail_purchase_id = :i",
+            {"i": purchase_id},
+        )
+    ]
+
+
+async def test_an_opened_purchase_gets_its_rail_neutral_parent_when_the_ledger_is_on(
+    client, monkeypatch
+):
+    """Payment orchestration P0: the parent is written after the create commits, copied from the
+    committed row, and the 202 the agent sees is unchanged."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    purchase_id = resp.json()["purchase_id"]
+    assert set(resp.json()) == {
+        "purchase_id", "status", "poll_after_seconds", "checkout_dispatch_state",
+        "contact_reentry_required",
+    }
+    [parent] = await _agent_purchase_parents(purchase_id)
+    assert parent["id"].startswith("pp_")
+    assert parent["executor"] == "rail_managed"
+    assert parent["agent_id"] == AGENT
+    assert parent["agent_user_ref_hash"] == hash_agent_user_ref(USER_REF)
+
+
+async def test_no_parent_is_written_while_the_ledger_is_off(client, monkeypatch):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.delenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, raising=False)
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    assert await _agent_purchase_parents(resp.json()["purchase_id"]) == []
+
+
+async def test_a_failing_ledger_never_fails_or_rolls_back_the_purchase(client, monkeypatch):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+
+    async def _boom(*a, **k):
+        raise RuntimeError("agent_purchases unavailable")
+
+    monkeypatch.setattr(agent_purchase_ledger, "ensure_reap_parent", _boom)
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["state"] == "resolving"
+
+
 async def test_the_price_is_our_catalogs_and_the_request_cannot_move_it(client):
     """THE CENTRAL GUARD. `verify_quote` compares `quantity * our_price_minor` against Reap's
     subtotal EXACTLY. If the caller could set that number, the comparison would be the caller's

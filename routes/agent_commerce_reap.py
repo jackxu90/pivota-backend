@@ -97,6 +97,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr, model_validator
 
+import db.agent_purchase_ledger as agent_purchase_ledger
 import db.reap_agentic_ledger as ledger
 import db.reap_continuation as continuation
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
@@ -2544,6 +2545,27 @@ async def _owner_public_body(row):
     return body
 
 
+async def _record_purchase_parent(purchase_id: str) -> None:
+    """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
+
+    AFTER this route's own transaction has committed, never inside it, and it never raises: the
+    parent is derived entirely from the committed purchase row, so a parent that is not written
+    here is written by the unified read's heal or by the backfill, and a fault in this table can
+    never fail, delay or roll back a purchase. Dark unless AGENT_PURCHASE_LEDGER_ENABLED is on.
+    Idempotent, so an idempotent replay of the create is harmless here too.
+    """
+    if not agent_purchase_ledger.is_enabled():
+        return
+    try:
+        await agent_purchase_ledger.ensure_reap_parent(purchase_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "reap_agentic: agent_purchases parent not written purchase=%s error_type=%s",
+            purchase_id,
+            type(exc).__name__,
+        )
+
+
 def _not_found() -> JSONResponse:
     """WRONG OWNER AND NO SUCH PURCHASE ARE THE SAME ANSWER. 404, never 403: a 403 confirms the
     id exists, which turns this endpoint into an oracle for guessing other buyers' purchase ids.
@@ -3077,6 +3099,7 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
+        await _record_purchase_parent(purchase_id)
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],

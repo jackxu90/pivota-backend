@@ -143,6 +143,7 @@ from routes.crawl_identity import router as crawl_identity_router  # Web Bot Aut
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
+from routes.agent_commerce_purchases import router as agent_commerce_purchases_router
 from routes.reap_return import router as reap_return_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
@@ -1157,6 +1158,9 @@ app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 # when a dial is on is a router whose mounting is itself untested, and the dial is read per
 # request so flipping it must not need a redeploy.
 app.include_router(agent_commerce_reap_router)
+# GET /agent/v2/commerce/purchases[/{id}]: the rail-neutral purchase read (payment orchestration
+# P0). Read-only; dark (404) unless AGENT_PURCHASE_LEDGER_ENABLED, read per request.
+app.include_router(agent_commerce_purchases_router)
 # GET/HEAD /reap/return: the static page Reap's hosted checkout sends the buyer's browser back to
 # (the rail's default returnUrl is https://api.pivota.cc/reap/return). Public and NOT dialled:
 # a buyer mid-purchase must never land on a 404 because an operator turned the rail off. It
