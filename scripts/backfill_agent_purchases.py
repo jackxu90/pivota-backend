@@ -32,13 +32,10 @@ async def run(args: argparse.Namespace) -> int:
 
     await database.connect()
     try:
-        await ledger.ensure_agent_purchase_schema()
         if args.dry_run:
-            rows = await database.fetch_all(
-                ledger._SELECT_REAP_MISSING_PARENTS_SQL, {"limit": 1_000_000}
-            )
-            print(f"missing_parents={len(rows)}")
+            print(f"missing_parents={await ledger.count_missing_reap_parents()}")
             return 0
+        await ledger.ensure_agent_purchase_schema()
         total = 0
         for batch in range(args.max_batches):
             examined = await ledger.backfill_reap_parents(limit=args.batch)

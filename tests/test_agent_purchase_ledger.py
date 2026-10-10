@@ -68,7 +68,7 @@ async def _parent_rows():
 
 
 def _check_values(ddl: str, column: str) -> tuple:
-    match = re.search(rf"{column}\s+VARCHAR\(\d+\)\s+NOT NULL CHECK \({column} IN \(([^)]*)\)\)", ddl)
+    match = re.search(rf"CONSTRAINT ck_agent_purchases_{column} CHECK \({column} IN \(([^)]*)\)\)", ddl)
     assert match, f"no CHECK for {column}"
     return tuple(v.strip().strip("'") for v in match.group(1).split(","))
 
@@ -270,9 +270,51 @@ async def test_the_owner_heal_touches_only_that_owner():
     assert theirs not in [r["rail_purchase_id"] for r in await _parent_rows()]
 
 
+async def test_the_owner_heal_takes_the_newest_first_the_order_the_list_pages_in():
+    ids = []
+    for days in (3, 2, 1):
+        rp = await _reap()
+        await database.execute(
+            f"UPDATE reap_agentic_purchases SET created_at = datetime('now', '-{days} day') WHERE id = :i",
+            {"i": rp},
+        )
+        ids.append(rp)
+    assert await purchases.heal_reap_parents_for_owner(AGENT, OWNER, limit=1) == 1
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [ids[-1]]
+
+
+async def test_the_dry_run_count_matches_what_the_backfill_parents():
+    for _ in range(3):
+        await _reap()
+    assert await purchases.count_missing_reap_parents() == 3
+    assert await purchases.backfill_reap_parents() == 3
+    assert await purchases.count_missing_reap_parents() == 0
+
+
 async def test_the_backfill_never_writes_a_reap_row():
     rp = await _reap()
     before = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases WHERE id = :i", {"i": rp}))
     await purchases.backfill_reap_parents()
     after = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases WHERE id = :i", {"i": rp}))
     assert before == after
+
+
+def test_the_prepare_gate_collects_the_postgres_statements_of_this_module():
+    """Driver property 5 (db/reap_agentic_ledger.py): a statement the PREPARE gate cannot see ships
+    unplanned. The write and the DDL were once chosen by a conditional expression, which hid both."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_prepare_gate", _REPO / "tests/test_repo_sql_prepare_postgres.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    collected = [" ".join(str(sql).split()) for _where, sql in gate.collect_statements()]
+    for statement in (
+        purchases._INSERT_REAP_PARENT_SQL,
+        purchases._CREATE_TABLE_PG,
+        purchases._SELECT_FOR_OWNER_SQL,
+        purchases._LIST_FOR_OWNER_SQL,
+        purchases._COUNT_REAP_MISSING_PARENTS_SQL,
+    ):
+        assert " ".join(statement.split()) in collected, statement.split("\n")[1][:60]

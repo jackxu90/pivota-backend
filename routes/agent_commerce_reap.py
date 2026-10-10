@@ -83,6 +83,7 @@ and no values — and it is mapped to a bare reason code below rather than forwa
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -2545,6 +2546,10 @@ async def _owner_public_body(row):
     return body
 
 
+#: The most the post-commit parent write may add to the create's 202 (see `_record_purchase_parent`).
+_RECORD_PARENT_TIMEOUT_S = 1.0
+
+
 async def _record_purchase_parent(purchase_id: str) -> None:
     """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
 
@@ -2552,13 +2557,18 @@ async def _record_purchase_parent(purchase_id: str) -> None:
     parent is derived entirely from the committed purchase row, so a parent that is not written
     here is written by the unified read's heal or by the backfill, and a fault in this table can
     never fail, delay or roll back a purchase. Dark unless AGENT_PURCHASE_LEDGER_ENABLED is on.
-    Idempotent, so an idempotent replay of the create is harmless here too.
+    BOUNDED: it is awaited inside the 202 path, so a stalled ledger write (a held SQLite writer, queued
+    DDL, an exhausted pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of
+    holding the agent's response. An idempotent replay returns before this hook and a duplicate loser
+    never reaches it; both get their parent from the heal or the backfill.
     """
     if not agent_purchase_ledger.is_enabled():
         return
     try:
-        await agent_purchase_ledger.ensure_reap_parent(purchase_id)
-    except Exception as exc:  # noqa: BLE001
+        await asyncio.wait_for(
+            agent_purchase_ledger.ensure_reap_parent(purchase_id), timeout=_RECORD_PARENT_TIMEOUT_S
+        )
+    except Exception as exc:  # noqa: BLE001 (TimeoutError included)
         logger.warning(
             "reap_agentic: agent_purchases parent not written purchase=%s error_type=%s",
             purchase_id,

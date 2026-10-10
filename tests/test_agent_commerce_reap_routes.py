@@ -1354,6 +1354,25 @@ async def test_a_failing_ledger_never_fails_or_rolls_back_the_purchase(client, m
     assert row["state"] == "resolving"
 
 
+async def test_a_stalled_ledger_write_cannot_hold_the_202(client, monkeypatch):
+    import asyncio
+    import time
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    monkeypatch.setattr(routes_reap, "_RECORD_PARENT_TIMEOUT_S", 0.05)
+
+    async def _stall(*a, **k):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(agent_purchase_ledger, "ensure_reap_parent", _stall)
+    await _seed_all()
+    started = time.monotonic()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    assert time.monotonic() - started < 5
+
+
 async def test_the_price_is_our_catalogs_and_the_request_cannot_move_it(client):
     """THE CENTRAL GUARD. `verify_quote` compares `quantity * our_price_minor` against Reap's
     subtotal EXACTLY. If the caller could set that number, the comparison would be the caller's

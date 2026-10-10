@@ -52,6 +52,10 @@ REAP_STATE_MAP: Dict[str, str] = {
 RAIL_EXECUTOR: Dict[str, str] = {"reap": "rail_managed"}
 _STATE_MAPS: Dict[str, Dict[str, str]] = {"reap": REAP_STATE_MAP}
 
+#: A rail's own purchase id prefix -> rail. The unified routes accept a rail id wherever a `pp_` id is
+#: accepted; this is the one place that says which rail an id belongs to.
+RAIL_ID_PREFIX: Dict[str, str] = {"rp_": "reap"}
+
 #: The unified states in which the buyer must act on a rail-hosted page, and what that page is for.
 BUYER_ACTION_KIND: Dict[str, str] = {
     "needs_payment_method": "card_binding",

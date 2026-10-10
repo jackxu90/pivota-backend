@@ -16,14 +16,18 @@
 -- No foreign key to the child, for the same reason reap_agentic_purchases.enrollment_id has none:
 -- the child table differs per rail.
 --
--- Production startup runs in fast mode and skips db/migrations/; the same DDL is in
--- db/agent_purchase_ledger._CREATE_TABLE_PG, run by db/schema_guard.ensure_required_schema_light.
--- tests/test_agent_purchase_ledger_postgres.py proves the two build the same schema.
+-- The same DDL is in db/agent_purchase_ledger._CREATE_TABLE_PG, run by
+-- db/schema_guard.ensure_required_schema_light; whichever runs first in an environment (fast-mode boots
+-- skip this directory, the boot runner applies it otherwise) builds the table, and
+-- tests/test_agent_purchase_ledger_postgres.py proves the two build the same schema. Safe under the boot
+-- runner's single transaction with no lock_timeout: a new, empty table and two indexes on it lock no
+-- existing table. CHECKs are named so the next rail's migration can DROP CONSTRAINT and re-add them.
 
 CREATE TABLE IF NOT EXISTS agent_purchases (
     id VARCHAR(64) PRIMARY KEY,
-    rail VARCHAR(16) NOT NULL CHECK (rail IN ('reap')),
-    executor VARCHAR(24) NOT NULL CHECK (executor IN ('rail_managed')),
+    rail VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap')),
+    executor VARCHAR(24) NOT NULL
+        CONSTRAINT ck_agent_purchases_executor CHECK (executor IN ('rail_managed')),
     rail_purchase_id VARCHAR(64) NOT NULL,
     agent_id VARCHAR(128),
     agent_user_ref_hash VARCHAR(64),

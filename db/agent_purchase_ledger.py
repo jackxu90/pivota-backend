@@ -28,8 +28,9 @@ unique index, so any number of concurrent healers leave exactly one row.
 
 This module opens no database transactions (same reason as the Reap ledger:
 databases==0.7.0 scopes connections by ContextVar, so a held transaction swallows concurrent
-tasks' writes). Every statement is a module-level constant so the PREPARE gate
-(tests/test_repo_sql_prepare_postgres.py) sees it.
+tasks' writes). Every statement is a module-level string literal passed by name, with dialect splits as
+`if`/`else` statements, so the PREPARE gate (tests/test_repo_sql_prepare_postgres.py) plans each one; a
+test in tests/test_agent_purchase_ledger_postgres.py holds that.
 """
 
 from __future__ import annotations
@@ -49,7 +50,8 @@ AGENT_PURCHASE_LEDGER_ENABLED_ENV = "AGENT_PURCHASE_LEDGER_ENABLED"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
 
 #: The vocabularies. The CHECKs in `_CREATE_TABLE_PG` hold the same strings; a test parses them
-#: back out so the two cannot disagree.
+#: back out so the two cannot disagree. The CHECKs are NAMED so the next rail's migration can
+#: `DROP CONSTRAINT ck_agent_purchases_rail` and re-add it (CREATE TABLE IF NOT EXISTS never alters).
 RAILS = ("reap",)
 EXECUTORS = ("rail_managed",)
 
@@ -61,16 +63,20 @@ def is_enabled() -> bool:
 
 # ── schema ───────────────────────────────────────────────────────────────────────────────────
 #
-# db/migrations/263_agent_purchases.sql is the same DDL. Production startup runs in fast mode and
-# skips db/migrations/, so db/schema_guard.ensure_required_schema_light calls
-# `ensure_agent_purchase_schema` on both dialects. tests/test_agent_purchase_ledger_postgres.py
-# proves the two build the same columns, indexes and CHECKs.
+# db/migrations/263_agent_purchases.sql is the same DDL. Which of the two builds the table in a given
+# environment depends on its startup mode (a fast-mode boot skips db/migrations/; the boot runner
+# applies unledgered files otherwise), so BOTH must be safe and identical:
+# db/schema_guard.ensure_required_schema_light calls `ensure_agent_purchase_schema` on both dialects,
+# and tests/test_agent_purchase_ledger_postgres.py proves the two build the same columns, indexes and
+# CHECKs. The DDL is a new, empty table and two indexes on it: it locks no existing table, so it is
+# safe under the boot runner's single transaction without a lock_timeout.
 
 _CREATE_TABLE_PG = """
 CREATE TABLE IF NOT EXISTS agent_purchases (
     id VARCHAR(64) PRIMARY KEY,
-    rail VARCHAR(16) NOT NULL CHECK (rail IN ('reap')),
-    executor VARCHAR(24) NOT NULL CHECK (executor IN ('rail_managed')),
+    rail VARCHAR(16) NOT NULL CONSTRAINT ck_agent_purchases_rail CHECK (rail IN ('reap')),
+    executor VARCHAR(24) NOT NULL
+        CONSTRAINT ck_agent_purchases_executor CHECK (executor IN ('rail_managed')),
     rail_purchase_id VARCHAR(64) NOT NULL,
     agent_id VARCHAR(128),
     agent_user_ref_hash VARCHAR(64),
@@ -99,7 +105,12 @@ CREATE INDEX IF NOT EXISTS idx_agent_purchases_owner
 
 async def ensure_agent_purchase_schema() -> None:
     """Self-heal parity with migration 263. Idempotent; called at every startup."""
-    await database.execute(_CREATE_TABLE_PG if IS_POSTGRES else _CREATE_TABLE_SQLITE)
+    # `if`/`else` statements, not a conditional expression: the PREPARE gate resolves only a literal or a
+    # module-level name as the first argument, and an IfExp hides BOTH statements from it.
+    if IS_POSTGRES:
+        await database.execute(_CREATE_TABLE_PG)
+    else:
+        await database.execute(_CREATE_TABLE_SQLITE)
     await database.execute(_CREATE_RAIL_INDEX)
     await database.execute(_CREATE_OWNER_INDEX)
 
@@ -154,14 +165,16 @@ async def ensure_reap_parent(rail_purchase_id: str, *, basis: str = "agent_selec
     rail_purchase_id = str(rail_purchase_id or "").strip()
     if not rail_purchase_id:
         return None
-    await database.execute(
-        _INSERT_REAP_PARENT_SQL if IS_POSTGRES else _INSERT_REAP_PARENT_SQL_SQLITE,
-        {
-            "id": new_purchase_id(),
-            "routing_plan": _routing_plan(basis),
-            "rail_purchase_id": rail_purchase_id,
-        },
-    )
+    values = {
+        "id": new_purchase_id(),
+        "routing_plan": _routing_plan(basis),
+        "rail_purchase_id": rail_purchase_id,
+    }
+    # Statement form, not an IfExp, so the PREPARE gate plans the Postgres INSERT (see the schema note).
+    if IS_POSTGRES:
+        await database.execute(_INSERT_REAP_PARENT_SQL, values)
+    else:
+        await database.execute(_INSERT_REAP_PARENT_SQL_SQLITE, values)
     row = await database.fetch_one(
         _SELECT_PARENT_ID_SQL, {"rail": "reap", "rail_purchase_id": rail_purchase_id}
     )
@@ -179,6 +192,21 @@ _SELECT_REAP_MISSING_PARENTS_SQL = """
      LIMIT :limit
 """
 
+_COUNT_REAP_MISSING_PARENTS_SQL = """
+    SELECT COUNT(*) AS missing
+      FROM reap_agentic_purchases r
+     WHERE NOT EXISTS (
+            SELECT 1 FROM agent_purchases p
+             WHERE p.rail = 'reap' AND p.rail_purchase_id = r.id
+           )
+"""
+
+
+async def count_missing_reap_parents() -> int:
+    row = await database.fetch_one(_COUNT_REAP_MISSING_PARENTS_SQL)
+    return int(row["missing"]) if row else 0
+
+
 _SELECT_REAP_MISSING_PARENTS_FOR_OWNER_SQL = """
     SELECT r.id
       FROM reap_agentic_purchases r
@@ -188,7 +216,7 @@ _SELECT_REAP_MISSING_PARENTS_FOR_OWNER_SQL = """
             SELECT 1 FROM agent_purchases p
              WHERE p.rail = 'reap' AND p.rail_purchase_id = r.id
            )
-     ORDER BY r.created_at, r.id
+     ORDER BY r.created_at DESC, r.id DESC
      LIMIT :limit
 """
 
@@ -212,8 +240,8 @@ async def backfill_reap_parents(*, limit: int = 500) -> int:
 async def heal_reap_parents_for_owner(
     agent_id: str, agent_user_ref_hash: str, *, limit: int = 100
 ) -> int:
-    """The same backfill, scoped to one owner, so their history is complete the first time the
-    unified list is read rather than after the next backfill run."""
+    """The same backfill, scoped to one owner and NEWEST first (the order the list pages in), so the
+    first page is complete the first time it is read rather than after the next backfill run."""
     rows = await database.fetch_all(
         _SELECT_REAP_MISSING_PARENTS_FOR_OWNER_SQL,
         {

@@ -23,8 +23,9 @@ Errors arrive in the app-wide envelope; read the reason at `detail.error`.
 
 ## `GET /agent/v2/commerce/purchases/{purchase_id}`
 
-`purchase_id` is a `pp_…` id, or a Reap `rp_…` id (a Reap purchase opened before the ledger
-existed gets its `pp_` id on this first read).
+`purchase_id` is a `pp_<24 hex>` id, or a Reap `rp_<24 hex>` id (a Reap purchase opened before the
+ledger existed gets its `pp_` id on this first read). Any other shape is 404 `purchase_not_found`,
+decided before any database read.
 
 ```json
 {
@@ -41,7 +42,7 @@ existed gets its `pp_` id on this first read).
     "type": "open_url",
     "kind": "approval",
     "url": "https://…",
-    "expires_at": "2026-10-10T11:15:00Z"
+    "expires_at": "2026-10-10T11:15:00+00:00"
   },
   "detail": {"…": "the rail's own owner-facing body, byte for byte"}
 }
@@ -57,11 +58,16 @@ existed gets its `pp_` id on this first read).
 - `detail`: exactly what `GET /agent/v2/commerce/reap/purchases/{rp_id}` returns.
 - 503 `state_unmapped`: the rail reported a state this service has no unified word for. Do not
   infer anything; retry later.
+- 503 `ledger_unavailable`: the ledger could not be read. Says nothing about the purchase; retry.
+- Reads do not depend on the Reap rail's own dial: like Reap's GET, a stored purchase stays
+  readable while the rail is switched off.
 
 ## `GET /agent/v2/commerce/purchases?limit=N`
 
 The caller's purchases, newest first, each in the shape above. `limit` is 1..100 (default 20);
-out of range is 400 `invalid_request`, never a silent clamp.
+out of range is 400 `invalid_request`, never a silent clamp. The page is all-or-nothing: if any
+purchase on it is in a state with no unified word, the whole list answers 503 `state_unmapped`
+rather than leaving that purchase out (a missing row would read as a purchase that does not exist).
 
 ```json
 {"purchases": [{"purchase_id": "pp_…", "…": "…"}], "limit": 20}
@@ -69,10 +75,13 @@ out of range is 400 `invalid_request`, never a silent clamp.
 
 ## Operations
 
-- Turn on: set `AGENT_PURCHASE_LEDGER_ENABLED=1` on the backend. From then on the Reap create
-  route writes each new purchase's parent after its own commit (best-effort; a failure there is
-  logged and never affects the purchase).
-- Backfill older purchases (idempotent, safe beside live traffic):
-  `python scripts/backfill_agent_purchases.py --dry-run`, then without `--dry-run`. Reads also
-  heal: a single read heals that purchase, and a list read heals that owner's history.
+- Turn on, in this order:
+  1. Backfill while the dial is still off (the table exists from the self-heal; the backfill is
+     idempotent and safe beside live traffic): `python scripts/backfill_agent_purchases.py --dry-run`,
+     then without `--dry-run`.
+  2. Set `AGENT_PURCHASE_LEDGER_ENABLED=1`. From then on the Reap create route writes each new
+     purchase's parent after its own commit (best-effort, at most 1 s; a failure or a timeout is
+     logged and never affects the purchase).
+  3. Run the backfill once more for purchases opened between steps 1 and 2.
+  Reads also heal: a single read heals that purchase, and a list read heals that owner's newest 100.
 - Turn off: unset the dial. The table stays; nothing reads or writes it.

@@ -238,7 +238,9 @@ async def test_another_owners_purchase_is_not_found_and_gets_no_parent(client, a
     assert resp.status_code == 404 and _error(resp) == "purchase_not_found"
 
 
-@pytest.mark.parametrize("purchase_id", ["pp_nope", "rp_nope", "ord_123", "pp_" + "x" * 80])
+@pytest.mark.parametrize("purchase_id", ["pp_nope", "rp_nope", "ord_123", "pp_" + "x" * 80,
+                                         "pp_0123456789ABCDEF01234567", "pp_0123456789abcdef0123456%00",
+                                         "xp_0123456789abcdef01234567"])
 async def test_unknown_or_malformed_ids_are_not_found(client, purchase_id):
     resp = await client.get(f"{BASE}/{purchase_id}")
     assert resp.status_code == 404 and _error(resp) == "purchase_not_found"
@@ -280,6 +282,44 @@ async def test_a_completed_purchase_carries_its_order_reference(client):
     assert body["state"] == "completed"
     assert body["order_reference"] == "ord_merchant_1"
     assert "next_action" not in body
+
+
+async def test_a_card_binding_wait_carries_a_card_binding_action(client):
+    rp = await _reap(state="needs_enrollment")
+    await database.execute(
+        "INSERT INTO reap_agentic_enrollments (id, buyer_ref, agent_id, status, hosted_url, "
+        "hosted_url_expires_at) VALUES ('re_unified_1', 'bref_ada', :a, 'pending', "
+        "'https://pay.prava.space/enroll/abc', '2999-01-01 00:00:00')",
+        {"a": AGENT},
+    )
+    await database.execute(
+        "UPDATE reap_agentic_purchases SET enrollment_id = 're_unified_1', "
+        "hosted_url = 'https://pay.prava.space/enroll/abc', hosted_url_expires_at = '2999-01-01 00:00:00' "
+        "WHERE id = :i",
+        {"i": rp},
+    )
+    resp = await client.get(f"{BASE}/{rp}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["state"] == "needs_payment_method"
+    assert body["next_action"]["kind"] == "card_binding"
+    assert body["next_action"]["url"] == "https://pay.prava.space/enroll/abc"
+    assert body["next_action"]["expires_at"] == body["detail"]["hosted_url_expires_at"]
+
+
+async def test_a_missing_ledger_table_is_a_503_not_a_500(client):
+    rp = await _reap()
+    await database.execute("DROP TABLE agent_purchases")
+    for url in (f"{BASE}/{rp}", BASE):
+        resp = await client.get(url)
+        assert resp.status_code == 503 and _error(resp) == "ledger_unavailable", url
+
+
+async def test_the_list_fails_whole_on_an_unmapped_state_rather_than_dropping_the_row(client, monkeypatch):
+    await _reap()
+    monkeypatch.setattr(unified_routes, "unified_state", lambda rail, state: None)
+    resp = await client.get(BASE)
+    assert resp.status_code == 503 and _error(resp) == "state_unmapped"
 
 
 async def test_an_unmapped_rail_state_is_a_503_not_a_guess(client, monkeypatch):
@@ -326,3 +366,17 @@ async def test_a_failing_heal_never_fails_the_list(client, monkeypatch):
     resp = await client.get(BASE)
     assert resp.status_code == 200
     assert [p["rail_purchase_id"] for p in resp.json()["purchases"]] == [rp]
+
+
+@pytest.mark.parametrize("purchase_id", ["pp_0123456789abcdef0123456%00", "rp_x%00", "pp_0123456789ABCDEF01234567"])
+async def test_a_malformed_id_never_reaches_a_database_bind(client, monkeypatch, purchase_id):
+    """On Postgres a NUL byte in a bound string raises out of asyncpg (a 500), so the id shape is decided
+    before any read. Spied here because SQLite would accept the bind and hide the difference."""
+    async def _forbidden(*a, **k):
+        raise AssertionError("a malformed id reached the ledger")
+
+    monkeypatch.setattr(purchases, "get_for_owner", _forbidden)
+    monkeypatch.setattr(purchases, "get_by_rail_id_for_owner", _forbidden)
+    monkeypatch.setattr(reap_ledger, "get_purchase_for_owner", _forbidden)
+    resp = await client.get(f"{BASE}/{purchase_id}")
+    assert resp.status_code == 404 and _error(resp) == "purchase_not_found"
