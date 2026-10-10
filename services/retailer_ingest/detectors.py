@@ -388,11 +388,15 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
         # the store's currency) drops a $0.01 promo variant in dollars, but in yen it is 1 yen, so a 1-yen
         # "free sample" variant survives into pdp.variants while the offer carries the real price (review of
         # this change, 2026-10-10). In dollars nothing changes: no variant under $1 reaches a record.
+        token_variants = sorted({p for p in _variant_prices(record) if p <= 0.5 * scale})
         if (_PLACEHOLDER.search(title) or re.search(r"\bdev\b", vendor, re.I)
-                or any(p <= 0.5 * scale or p >= 1000 * scale for p in prices)
-                or any(p <= 0.5 * scale for p in _variant_prices(record))):
+                or any(p <= 0.5 * scale or p >= 1000 * scale for p in prices) or token_variants):
+            # Name a token VARIANT in the detail: the offer may carry only the real price, and a reviewer who
+            # saw "prices [5500.0]" would accept the key -- applying exactly the 1-yen offer this rule stops.
             flags.append(_flag("placeholder_product", BLOCK, record,
-                               f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]})"))
+                               f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]}"
+                               + (f"; token variant prices {token_variants[:4]}" if token_variants else "")
+                               + ")"))
     if store_level:
         verdict = placeholder_price_store_verdict(cohort) if store_verdict is _OWN else store_verdict
         flags.extend(placeholder_price_store_flags(cohort, verdict))

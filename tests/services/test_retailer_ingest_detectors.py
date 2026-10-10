@@ -588,7 +588,9 @@ def test_a_one_yen_sample_variant_beside_a_real_price_holds_the_row():
                  vendor="KOSE", brand="KOSE", currency="JPY",
                  variants=[{"id": 44_100_000_001, "price": "5500", "available": True, "title": "200ml"},
                            {"id": 44_100_000_002, "price": "1", "available": True, "title": "Sample"}])
-    assert "placeholder_product" in rules(detectors.detect([rec], store_level=False), detectors.BLOCK)
+    flags = [f for f in detectors.detect([rec], store_level=False) if f["rule"] == "placeholder_product"]
+    assert flags and flags[0]["severity"] == detectors.BLOCK
+    assert "token variant prices [1.0]" in flags[0]["detail"]  # the reviewer sees the 1-yen variant, not only 5500
 
 
 def test_a_dollar_row_is_untouched_by_the_variant_low_bound():
@@ -629,7 +631,8 @@ def test_the_yen_modal_path_alone_holds():
 def test_a_mixed_currency_population_takes_the_largest_scale():
     # Unreachable through the pipeline (it stops a job whose records disagree on currency), but the verdict
     # must be deterministic and fail safe: yen tokens judged on the yen scale, whatever the set order.
-    recs = (store([[100.0]] * 30, domain="example.jp", currency="JPY")
-            + store([[v] for v in _varied(10, 30.0)], domain="example.com", currency="USD"))
+    # USD is the MAJORITY (25 of 40), so only the largest-scale rule judges the 15 yen tokens as tokens.
+    recs = (store([[v] for v in _varied(25, 30.0)], domain="example.com", currency="USD")
+            + store([[100.0]] * 15, domain="example.jp", currency="JPY"))
     verdict = detectors.placeholder_price_store_verdict(recs)
     assert verdict is not None and verdict["ceiling"] >= 100.0
