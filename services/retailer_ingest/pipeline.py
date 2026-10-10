@@ -65,8 +65,14 @@ _OPTION_TYPES = {
     # product datafeed; services/retailer_ingest/affiliate_feed.py) -- for stores that block crawlers --
     # or "shopify_markets" (services/retailer_ingest/shopify_markets.py: USD SIBLING offers, read inside
     # a US-localized session whose /cart.js proves USD, for products a base-currency crawl of the same
-    # storefront already wrote; multi-market storefronts ADR Phase 2).
+    # storefront already wrote; multi-market storefronts ADR Phase 2). Since 2026-10-10 (Peng: "Build the
+    # SG currency support") its options.market may be SG too: SGD siblings from an SG-localized session.
     "source": str, "feed": dict,
+    # Storefront crawls only (2026-10-10): refuse the crawl (status `nothing`) unless the store's own
+    # /meta.json ships_to_countries names the job's market. The crawl records ships_to on every run but
+    # has never gated on it, so a USD-base retailer that does not ship to the US would land as a US seller.
+    # Opt-in, so no existing cohort changes: set it on the base crawl that precedes an SG capture.
+    "require_ships_to_market": bool,
     # Whose store this is: "retailer" (default) or "brand_official" (the brand's own storefront, the
     # ADR-001 canonical anchor). services.catalog_onboard_worker.normalize_curated_brand_payload owns
     # the allowed values and the retailer_name rule; enqueue runs that same normalization.
@@ -196,9 +202,13 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
     source = options.get("source") or "storefront"
     if source not in SOURCES:
         raise ValueError(f"options.source must be one of {list(SOURCES)}")
-    if options.get("multi_brand") and (options.get("source_role", "retailer") != "retailer" or source != "storefront"):
+    if options.get("multi_brand") and (options.get("source_role", "retailer") != "retailer"
+                                       or source not in ("storefront", MARKETS_SOURCE)):
         # A brand's own store is one brand (its domain must prove it); a feed maps one retailer listing.
-        raise ValueError("options.multi_brand supports only a retailer storefront cohort")
+        # A shopify_markets capture of a multi_brand retailer cohort (2026-10-10, SG only: below) prices
+        # the rows that cohort's storefront crawl wrote, selected by the same vendors and brands.
+        raise ValueError("options.multi_brand supports only a retailer storefront cohort (or its "
+                         "shopify_markets capture)")
     if "retire_stale_brand" in options and (options.get("source_role") != "brand_official"
                                             or source != "storefront" or options.get("multi_brand")):
         # The retire derives each old key from (old spelling, title) and matches it to THIS store's rows: a
@@ -277,17 +287,26 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
         if market not in INGEST_MARKETS:
             raise ValueError(f"options.market {market} is not an ingest market yet (allowed: {list(INGEST_MARKETS)})")
         options["market"] = market  # "us" and "US" are one cohort (db.retailer_ingest.scope_key agrees)
+    if "require_ships_to_market" in options and source != "storefront":
+        raise ValueError("options.require_ships_to_market is only meaningful on a storefront crawl")
     if source == MARKETS_SOURCE:
-        if options.get("source_role") != "brand_official":
-            # Brand stores first (Peng 2026-09-26). Retailers (kokorojapanstore, kiokii) follow in a later
-            # PR: their sibling offers would need the retailer seller identity and review this lane has not
-            # built for a captured price.
-            raise ValueError("options.source = shopify_markets supports only source_role = brand_official "
-                             "(retailers follow later)")
-        if job_market(options) != DEFAULT_MARKET:
-            # The capture proves a US session (/cart.js reports USD) and writes market 'US' siblings. It is
-            # never the way to price a store for AU/JP: that is its base-currency crawl.
-            raise ValueError(f"options.source = shopify_markets captures the {DEFAULT_MARKET} market only")
+        from services.retailer_ingest.shopify_markets import CAPTURE_MARKETS
+        if job_market(options) not in CAPTURE_MARKETS:
+            # The capture proves a session in a SERVED market (/cart.js reports its currency) and writes
+            # siblings stamped with it. It is never the way to price a store for AU/JP: that is its
+            # base-currency crawl.
+            raise ValueError(f"options.source = shopify_markets captures the {' and '.join(CAPTURE_MARKETS)} "
+                             f"markets only")
+        if options.get("source_role") != "brand_official" and job_market(options) != "SG":
+            # Brand stores first (Peng 2026-09-26) still holds for the US: US retailers follow later. SG retailers are allowed (Peng 2026-10-10, "Build the SG currency
+            # support": nearly every SG pair the coverage wave found is a retailer). The gate is the
+            # MARKET, in code, not an env or a job option: an env would have to match on the enqueue runner
+            # and on the drain (whose image and env have a single writer), and a job option is the operator
+            # vouching for themselves. A retailer sibling copies the retailer's own seller identity from its
+            # base offer (merchant_id, offer_type, offer_mode redirect), so nothing new is claimed for it.
+            raise ValueError("options.source = shopify_markets supports source_role = retailer for market SG "
+                             "only; a US capture is source_role = brand_official only (brand stores first, "
+                             "Peng 2026-09-26; US retailers follow later)")
     elif job_market(options) in ACQUISITION_MARKETS and source != "storefront":
         # An acquisition job is the BASE-CURRENCY crawl of a storefront (ADR Phase 2, operator step 1):
         # the rows a shopify_markets capture later prices in USD. A feed has no such storefront.
@@ -827,6 +846,20 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
             "ships_to_count": len(ships) if isinstance(ships, list) else None,
             "ships_to_market": (market in ships) if isinstance(ships, list) else None,
         }
+    if o.get("require_ships_to_market"):
+        # 2026-10-10 (SG capture work): the gate the recorded ships_to never was, opt-in per job. A USD-base
+        # retailer's base crawl is a US job, so without it a store that does not ship to the US would land as
+        # a US seller; the SG capture that follows refuses such a store too (base_market_not_shipped).
+        ships = storefront.get("ships_to_countries") if isinstance(storefront, dict) else None
+        if not isinstance(ships, list):
+            raise _Stop("ships_to_unverifiable", "failed",
+                        f"options.require_ships_to_market: {job['domain']}'s /meta.json did not state "
+                        f"ships_to_countries, so shipping to {market} is unproven; nothing written", checks=checks)
+        if market not in ships:
+            raise _Stop("store_does_not_ship_to_market", "nothing",
+                        f"options.require_ships_to_market: {job['domain']}'s /meta.json ships_to_countries "
+                        f"({len(ships)} countries) does not include {market}: not a {market} seller; "
+                        f"nothing written", checks=checks)
     if o.get("source_role") == "brand_official":
         # Every brand the cohort would write: the job's, and each record's own (its vendor's).
         written = [job["brand"]] + sorted({str((r.get("pdp") or {}).get("brand") or "") for r in records} - {""})
@@ -1511,12 +1544,13 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
                              result: Dict[str, Any], *, db: Any, deadline: Optional[float] = None) -> Dict[str, Any]:
     """One stage of a source=shopify_markets job (services/retailer_ingest/shopify_markets.py).
 
-    Same shape as a crawl job: the dry run proves the US session and reads every price, writing
-    nothing; a clean dry run is applied automatically (Peng's policy); the apply RE-proves the session,
-    re-reads every price, and only then writes the USD siblings under the catalog write lock, republishes
-    the touched content_keys and reads them back. A store that does not confirm USD is a clean refusal
-    (status `nothing`, the reason and the evidence on the run), never a crash; a block fails the job as
-    unverifiable; a 429/5xx backs off like a throttled crawl."""
+    Same shape as a crawl job: the dry run proves the session in the job's market (US, or SG since
+    2026-10-10) and reads every price, writing nothing; a clean dry run is applied automatically (Peng's
+    policy); the apply RE-proves the session, re-reads every price, and only then writes the siblings
+    (USD/US or SGD/SG) under the catalog write lock, republishes the touched content_keys and reads them
+    back. A store that does not confirm the market's currency is a clean refusal (status `nothing`, the
+    reason and the evidence on the run), never a crash; a block fails the job as unverifiable; a 429/5xx
+    backs off like a throttled crawl."""
     from services.retailer_ingest import shopify_markets as markets
 
     o = job.get("options") or {}
@@ -1524,6 +1558,10 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
         validate_options(dict(o))
     except ValueError as exc:
         raise _Stop("invalid_job", "failed", str(exc)) from exc
+    market, currency = job_market(o), job_currency(o)
+    # An SG sibling serves only where index_pipeline_state counts SGD as a served-region price: refuse
+    # before any request to the store, not after a write whose readback would fail (a no-op for US).
+    _require_served_market_is_served(market)
     try:
         with _timed(timings, "crawl_s"):
             capture = await markets.capture(job, db=db, max_products=int(o.get("max_products") or 200))
@@ -1538,12 +1576,12 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
                "flags": []}
     if not planned:
         raise _Stop("nothing_to_capture", "nothing",
-                    f"the US session was proven but no base offer has a sellable USD price "
+                    f"the {market} session was proven but no base offer has a sellable {currency} price "
                     f"({checks['markets_capture'].get('skipped')})", checks=checks)
     if stage == DRY_RUN:
         await ledger.finish_run(run_id, outcome="clean", **summary, db=db)
-        await _move(job, status="apply_due", run_id=run_id, reason=f"US session proven, {len(planned)} USD "
-                    f"sibling offer(s) planned; apply due", next_run_at=datetime.now(timezone.utc), db=db)
+        await _move(job, status="apply_due", run_id=run_id, reason=f"{market} session proven, {len(planned)} "
+                    f"{currency} sibling offer(s) planned; apply due", next_run_at=datetime.now(timezone.utc), db=db)
         return {"job_id": job["id"], "stage": stage, "outcome": "clean", "status": "apply_due"}
 
     checks.setdefault("catalog_write", ledger.CATALOG_WRITE_NOT_STARTED)
@@ -1557,7 +1595,8 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
             with _timed(timings, "write_s"):
                 wrote = await markets.write_siblings(planned, db=db)
                 failed = await markets.republish(
-                    sorted({r["content_key"] for r in wrote["written"] if r.get("content_key")}), db=db)
+                    sorted({r["content_key"] for r in wrote["written"] if r.get("content_key")}), db=db,
+                    source_system=markets.source_system_for(market))
     except CatalogWriteLockBusy as busy:
         timings["write_lock_wait_s"] = round(time.monotonic() - waiting, 3)
         raise await _write_not_started(
@@ -1571,12 +1610,15 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
     applied = {"written": len(wrote["written"]), "not_written": len(wrote["not_written"]),
                "refused": wrote["refused"], "republish_failed": len(failed)}
     with _timed(timings, "readback_s"):
-        readback = await markets.readback(wrote["written"], db=db, republish_failed=failed)
+        readback = await markets.readback(wrote["written"], db=db, republish_failed=failed, market=market)
     ok = readback["ok"]
     outcome = "applied" if ok else "readback_failed"
     await ledger.finish_run(run_id, outcome=outcome, **summary, applied=applied, readback=readback, db=db)
-    reason = (f"applied and verified: {applied['written']} USD sibling offer(s), "
-              f"{readback.get('served_content_keys', 0)} content_key(s) serving"
+    reason = (f"applied and verified: {applied['written']} {currency} sibling offer(s), "
+              + (f"{readback.get('served_content_keys', 0)} content_key(s) serving" if market == DEFAULT_MARKET
+                 # A USD retailer's content_key already serves through its US base offers, so a serving
+                 # count is no evidence about SG (review of #2553): the reason claims only what was checked.
+                 else f"{readback.get('served_content_keys', 0)} content_key(s) re-published")
               + (f"; {applied['not_written']} not written" if applied["not_written"] else "")
               if ok else f"{outcome}: {readback.get('problems')}")
     await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason[:2000], db=db)

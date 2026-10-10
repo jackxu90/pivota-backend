@@ -8,7 +8,7 @@ optional: market (ISO alpha-2, default US; allowed US and SG as served markets, 
 markets whose rows are stored but not served), require_currency (default and only allowed value: the market's
 currency, USD for US, SGD for SG, AUD for AU, JPY for JP), source (storefront | affiliate_feed | shopify_markets), category_path,
 only_category, only_resolved_category, lip_title_evidence, lash_nail_title_evidence, exclude_handles,
-max_scan_products, max_products, retailer_name.
+max_scan_products, max_products, retailer_name, require_ships_to_market.
 
 A Shopify-Markets brand store (AUD base, quotes USD to US buyers) is TWO jobs, in this order:
   1. {"domain": "gotoskincare.com", "brand": "Go-To", "vendors": ["Go-To"],
@@ -16,6 +16,14 @@ A Shopify-Markets brand store (AUD base, quotes USD to US buyers) is TWO jobs, i
   2. {"domain": "gotoskincare.com", "brand": "Go-To", "vendors": ["Go-To"],
       "options": {"source_role": "brand_official", "source": "shopify_markets"}}  -- USD siblings
 Queue 2 only after 1 is done: the capture prices only products 1 already wrote.
+
+SGD siblings for SG buyers (2026-10-10) are the same two jobs with "market": "SG" on the capture, and for
+SG only the store may be a retailer. The base crawl is the store's base-currency market (US for a USD store,
+JP for a JPY store; a CAD/GBP/KRW store has none yet), with "require_ships_to_market": true:
+  1. {"domain": "kbeauty-retailer.example.com", "brand": "COSRX", "vendors": ["COSRX"],
+      "options": {"retailer_name": "K-Beauty Retailer", "require_ships_to_market": true}}   -- USD rows, market US
+  2. {"domain": "kbeauty-retailer.example.com", "brand": "COSRX", "vendors": ["COSRX"],
+      "options": {"source": "shopify_markets", "market": "SG"}}                       -- SGD siblings
 
 Re-enqueueing a cohort that already has an open job is a no-op (reported as `exists`).
 Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.

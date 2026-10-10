@@ -17,6 +17,8 @@ pytestmark = pytest.mark.skipif(not URL.startswith("postgres"), reason="requires
 
 PREFIX = "mkt-gate-"
 HOST = "mkt-gate-goto.example"
+#: A retailer listing key (ingestion: "ext:" + "retailer:" + digest), cleaned up like PREFIX rows.
+RETAILER_PREFIX = "ext:retailer:" + PREFIX
 #: The dialect gate runs on `pivota_dialect_check` in CI (and fails on ANY skip); local runs use *_test.
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_")
 
@@ -81,10 +83,11 @@ async def db():
     try:
         yield database
     finally:
-        await database.execute("DELETE FROM catalog_offers WHERE product_key LIKE :p", {"p": PREFIX + "%"})
-        await database.execute("DELETE FROM catalog_skus WHERE product_key LIKE :p", {"p": PREFIX + "%"})
+        for prefix in (PREFIX, RETAILER_PREFIX):
+            await database.execute("DELETE FROM catalog_offers WHERE product_key LIKE :p", {"p": prefix + "%"})
+            await database.execute("DELETE FROM catalog_skus WHERE product_key LIKE :p", {"p": prefix + "%"})
+            await database.execute("DELETE FROM catalog_products WHERE product_key LIKE :p", {"p": prefix + "%"})
         await database.execute("DELETE FROM index_pipeline_state WHERE content_key LIKE :p", {"p": PREFIX + "%"})
-        await database.execute("DELETE FROM catalog_products WHERE product_key LIKE :p", {"p": PREFIX + "%"})
         await database.disconnect()
 
 
@@ -119,14 +122,16 @@ async def _ips(db, content_key, *, blocker, serving):
         " VALUES (:ck, 'quality_gated', :b, :s)", {"ck": content_key, "b": blocker, "s": serving})
 
 
-def _planned(base_offer_id, key, *, cents=3200):
+def _planned(base_offer_id, key, *, cents=3200, market="US"):
     from services.retailer_ingest import shopify_markets as markets
+    from services.region_pricing import pricing_currency_for_region
     price = cents / 100.0
-    return {"offer_id": markets.sibling_offer_id(base_offer_id), "base_offer_id": base_offer_id, "product_key": key,
-            "sku_key": key + "::canonical", "content_key": PREFIX + "ck", "market": "US", "currency": "USD",
-            "availability": "in_stock", "list_price": price, "merchant_effective_price": price,
-            "estimated_best_price": price, "price_confidence": 0.7, "source_system": markets.SOURCE_SYSTEM,
-            "offer_payload": json.dumps({"capture": markets.SOURCE_SYSTEM, "price_cents": cents})}
+    lane = markets.source_system_for(market)
+    return {"offer_id": markets.sibling_offer_id(base_offer_id, market), "base_offer_id": base_offer_id,
+            "product_key": key, "sku_key": key + "::canonical", "content_key": PREFIX + "ck", "market": market,
+            "currency": pricing_currency_for_region(market), "availability": "in_stock", "list_price": price,
+            "merchant_effective_price": price, "estimated_best_price": price, "price_confidence": 0.7,
+            "source_system": lane, "offer_payload": json.dumps({"capture": lane, "price_cents": cents})}
 
 
 async def test_the_candidate_read_returns_only_this_hosts_base_currency_crawl_rows(db):
@@ -139,10 +144,11 @@ async def test_the_candidate_read_returns_only_this_hosts_base_currency_crawl_ro
     await _offer(db, PREFIX + "other-lane", key, source_system="us_market_capture")     # not the base crawl
     await _offer(db, PREFIX + "gone", key)
     await db.execute("UPDATE catalog_offers SET suppressed_at = NOW() WHERE offer_id = :o", {"o": PREFIX + "gone"})
-    rows = await markets.load_candidates({"domain": "www." + HOST, "brand": "Go-To"}, db)
+    brand_store = {"source_role": "brand_official", "source": "shopify_markets"}  # every US capture's role
+    rows = await markets.load_candidates({"domain": "www." + HOST, "brand": "Go-To", "options": brand_store}, db)
     assert [(r["base_offer_id"], r["currency"], r["market"], r["source_variant_id"]) for r in rows] == [
         (PREFIX + "base", "AUD", "AU", key)]
-    assert await markets.load_candidates({"domain": HOST, "brand": "Sukin"}, db) == []
+    assert await markets.load_candidates({"domain": HOST, "brand": "Sukin", "options": brand_store}, db) == []
 
 
 async def test_a_sibling_takes_its_identity_from_the_base_offer_and_never_touches_it(db):
@@ -252,3 +258,54 @@ async def test_an_acquisition_readback_on_postgres(db):
                      {"o": PREFIX + "acq-us-store"})
     leak = await _readback([key], "AUD", db, market="AU", domain=HOST, planned_images={key: True})
     assert not leak["ok"] and "must never serve" in leak["problems"][0]["problem"]
+
+
+# ------------------------------------------------------------------ SG (Peng 2026-10-10)
+
+async def test_an_sg_capture_reads_a_usd_retailers_listing_rows_and_never_an_sgd_row(db):
+    """The same CANDIDATES_SQL with capture_currency SGD: the USD/US base rows of a retailer's listing are
+    candidates for SG (not for a US capture), an SGD row is not, and a retailer job keeps only its
+    ext:retailer: listings of its vendors (Python, over what Postgres returned)."""
+    from services.retailer_ingest import shopify_markets as markets
+    listing, canonical = RETAILER_PREFIX + "l1", PREFIX + "c1"
+    await _product(db, listing, content_key=PREFIX + "ck-l1", brand="Purito SEOUL")
+    await _product(db, canonical, content_key=PREFIX + "ck-c1", brand="Purito SEOUL")
+    await _offer(db, PREFIX + "l1-usd", listing, currency="USD", market="US")
+    await _offer(db, PREFIX + "l1-sgd", listing, currency="SGD", market="SG")
+    await _offer(db, PREFIX + "c1-usd", canonical, currency="USD", market="US")
+    job = {"domain": HOST, "brand": "Purito", "options": {"vendors": ["Purito"], "market": "SG",
+                                                          "source": "shopify_markets"}}
+    rows = await markets.load_candidates(job, db)
+    assert [(r["base_offer_id"], r["currency"], r["market"]) for r in rows] == [(PREFIX + "l1-usd", "USD", "US")]
+    us_brand_job = {"domain": HOST, "brand": "Purito SEOUL",
+                    "options": {"vendors": ["Purito"], "source_role": "brand_official", "source": "shopify_markets"}}
+    # A US capture reads the SAME statement with USD excluded: the SGD row (any key) is its candidate instead.
+    assert [r["base_offer_id"] for r in await markets.load_candidates(us_brand_job, db)] == [PREFIX + "l1-sgd"]
+
+
+async def test_a_us_and_an_sg_sibling_of_one_base_offer_coexist_and_read_back(db):
+    from services.retailer_ingest import shopify_markets as markets
+    key, ck = PREFIX + "p6", PREFIX + "ck"
+    await _product(db, key, content_key=ck)
+    await _offer(db, PREFIX + "base6", key, currency="JPY", market="JP", price=980.0)
+    us = await markets.write_siblings([_planned(PREFIX + "base6", key, cents=700)], db=db)
+    sg = await markets.write_siblings([_planned(PREFIX + "base6", key, cents=1290, market="SG")], db=db)
+    assert len(us["written"]) == len(sg["written"]) == 1
+    rows = {r["offer_id"]: dict(r) for r in await db.fetch_all(
+        "SELECT offer_id, market, currency, source_system, list_price, source_domain, merchant_id"
+        " FROM catalog_offers WHERE product_key = :k", {"k": key})}
+    sg_id, us_id = markets.sibling_offer_id(PREFIX + "base6", "SG"), markets.sibling_offer_id(PREFIX + "base6")
+    assert sg_id != us_id and len(rows) == 3
+    assert (rows[sg_id]["market"], rows[sg_id]["currency"], rows[sg_id]["source_system"],
+            float(rows[sg_id]["list_price"])) == ("SG", "SGD", "shopify_markets_sg_localization", 12.9)
+    assert (rows[us_id]["market"], rows[us_id]["currency"], float(rows[us_id]["list_price"])) == ("US", "USD", 7.0)
+    assert rows[sg_id]["source_domain"] == rows[PREFIX + "base6"]["source_domain"] == HOST
+    assert rows[sg_id]["merchant_id"] == rows[PREFIX + "base6"]["merchant_id"]
+    # A re-capture refreshes the SG price in place; the JPY base is untouched.
+    await markets.write_siblings([_planned(PREFIX + "base6", key, cents=1350, market="SG")], db=db)
+    assert float(await db.fetch_val("SELECT list_price FROM catalog_offers WHERE offer_id = :o", {"o": sg_id})) == 13.5
+    assert float(await db.fetch_val("SELECT list_price FROM catalog_offers WHERE offer_id = :o",
+                                    {"o": PREFIX + "base6"})) == 980.0
+    await _ips(db, ck, blocker="none", serving=True)
+    assert (await markets.readback(sg["written"], db=db, market="SG"))["ok"]
+    assert not (await markets.readback(sg["written"], db=db))["ok"]  # an SGD/SG row is not a US sibling
