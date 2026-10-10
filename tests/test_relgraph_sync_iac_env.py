@@ -37,7 +37,10 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_APPLY_REVIEW": "true",
     "RELGRAPH_SYNC_ALLOW_WRITES": "true",
     "RELGRAPH_SYNC_CONFIRM": "APPLY_RELGRAPH_SYNC_ROUTINE",
-    "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "45",
+    "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "90",
+    "RELGRAPH_SYNC_REVIEW_LIMIT": "1000",
+    "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "6",
+    "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED": "true",
     "VERTEX_AI_ENABLED": "true",
     "GOOGLE_CLOUD_PROJECT": "pivota-prod",
     "GOOGLE_CLOUD_LOCATION": "global",
@@ -101,12 +104,13 @@ def test_a_prod_reconcile_reproduces_the_live_env_var_for_var(tmp_path):
     assert env == LIVE_PROD_ENV
 
 
-def test_throughput_caps_stay_at_the_image_defaults_until_review_concurrency_ships(tmp_path):
-    # 1,000 sequential reviews (~7 s each) blow the step every night on an image without
-    # PIVOTA-Agent #2335; raise these together with RELGRAPH_SYNC_REVIEW_CONCURRENCY, not before.
+def test_review_limit_rises_only_with_concurrency_and_anchor_caps_stay_default(tmp_path):
+    # 1,000 sequential reviews (~7 s each) blow the step every night; the raise is only safe with
+    # bounded review concurrency (PIVOTA-Agent #2335, live since 2026-10-01): measured 2026-10-10,
+    # 1,000 reviews at concurrency 6 take ~27 minutes. The anchor caps stay at the image defaults.
     env = _relgraph_sync_env(_reconcile(tmp_path, "prod", {})[0])
-    for cap in ("RELGRAPH_SYNC_REVIEW_LIMIT", "RELGRAPH_SYNC_REVIEW_CONCURRENCY", "RELGRAPH_SYNC_LIMIT",
-                "RELGRAPH_SYNC_SELECT_LIMIT"):
+    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("1000", "6")
+    for cap in ("RELGRAPH_SYNC_LIMIT", "RELGRAPH_SYNC_SELECT_LIMIT"):
         assert cap not in env
 
 
