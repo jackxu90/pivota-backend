@@ -36,8 +36,9 @@ pytestmark = pytest.mark.skipif(
     reason="needs a Postgres DATABASE_URL — see the module docstring for the one-line setup",
 )
 
-_MIGRATION_260 = Path(__file__).resolve().parent.parent / "db/migrations/260_catalog_products_own_name_norm.sql"
-_MIGRATION_261 = Path(__file__).resolve().parent.parent / "db/migrations/261_catalog_products_name_norm_trgm_index.sql"
+# *.sql.disabled: hand-applied only (the boot runner must never pick them up); still the real DDL.
+_MIGRATION_260 = Path(__file__).resolve().parent.parent / "db/migrations/260_catalog_products_own_name_norm.sql.disabled"
+_MIGRATION_261 = Path(__file__).resolve().parent.parent / "db/migrations/261_catalog_products_name_norm_trgm_index.sql.disabled"
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _SCHEMA = f"own_name_norm_test_{os.getpid()}"
 

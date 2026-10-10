@@ -111,6 +111,32 @@ def list_migration_files(base_dir: Optional[str] = None) -> List[str]:
     return sorted(glob.glob(os.path.join(migrations_dir(base_dir), "*.sql")))
 
 
+# A ``*.sql.disabled`` file whose FIRST line starts with this marker is not retired:
+# it is schema that production gets by hand, in a one-off job, because applying it
+# from the boot runner would be unsafe (260: ACCESS EXCLUSIVE on the hottest table
+# behind multi-second reads; 261: an index that must follow 260's backfill). The
+# boot runner still never reads it -- only `list_migration_files` decides that --
+# but the test fixtures that rebuild production's schema from the migrations DO
+# apply it, in version order with the active files, so SQL written against those columns is
+# planned against the schema production actually has.
+HAND_APPLIED_MARKER = "-- HAND-APPLIED ONLY"
+
+
+def is_hand_applied_migration(path: str) -> bool:
+    """True for a ``*.sql.disabled`` file that opens with HAND_APPLIED_MARKER."""
+    if not path.endswith(".sql.disabled"):
+        return False
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.readline().startswith(HAND_APPLIED_MARKER)
+
+
+def list_hand_applied_migration_files(base_dir: Optional[str] = None) -> List[str]:
+    """Hand-applied migrations (see HAND_APPLIED_MARKER), in filename order.
+    Disjoint from `list_migration_files` by construction: a different glob."""
+    candidates = sorted(glob.glob(os.path.join(migrations_dir(base_dir), "*.sql.disabled")))
+    return [path for path in candidates if is_hand_applied_migration(path)]
+
+
 def _checksum(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 

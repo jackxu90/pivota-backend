@@ -73,6 +73,7 @@ real coverage, of 1,954 collected statements:
 
     metadata.create_all only .................  751 planned
     + db/migrations/*.sql .................... 1,518 planned
+      (+ the HAND-APPLIED *.sql.disabled files, see _fixture_migration_paths)
     + main.py's startup DDL .................. 1,790 planned
     + isolated from `public` ................. 1,826 planned
     + private database, UTF8 client ......... 1,835 planned,  122 unchecked
@@ -606,8 +607,40 @@ def _columns_declared_in_create(body: str, open_paren: int) -> set:
     return out
 
 
+def _version_key(path: Path) -> list:
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path.name)]
+
+
+def _fixture_migration_paths() -> List[Path]:
+    """The migrations production's schema is made of, in version order.
+
+    The ACTIVE files (`db/migrations/*.sql`, what the boot runner applies) plus
+    the HAND-APPLIED ones: `*.sql.disabled` files whose first line carries
+    `db.sql_migrations.HAND_APPLIED_MARKER`. Those are schema production gets
+    from a one-off job because the boot runner must never apply them (260 takes
+    ACCESS EXCLUSIVE on catalog_products behind multi-second reads; 261 is an
+    index that must follow 260's backfill). Production HAS them, so the SQL
+    written against their columns -- the backfill script's statements -- must
+    be planned against a schema that has them too. Leave them out and that SQL
+    fails here as `UndefinedColumnError:real`, a verdict about the fixture
+    dressed up as one about the statement.
+
+    The five RETIRED `*.sql.disabled` files (002/007/014/015/017) carry no
+    marker and stay out: production does not have what they describe.
+
+    Sorted as one list, so a hand-applied 260 runs after active 259 and before
+    an active 262 that may build on it.
+    """
+    from db.sql_migrations import list_hand_applied_migration_files
+
+    migrations = REPO_ROOT / "db" / "migrations"
+    paths = list(migrations.glob("*.sql"))
+    paths += [Path(p) for p in list_hand_applied_migration_files(str(REPO_ROOT))]
+    return sorted(paths, key=_version_key)
+
+
 def _columns_declared_by_migrations() -> Dict[str, set]:
-    """table -> every column name db/migrations/*.sql declares for it.
+    """table -> every column name the fixture's migrations declare for it.
 
     The yardstick for "did the fixture build this table faithfully". Compared
     against information_schema at fixture time; a table missing any declared
@@ -615,7 +648,7 @@ def _columns_declared_by_migrations() -> Dict[str, set]:
     rather than hand-listing tables keeps this correct as schema changes land.
     """
     declared: Dict[str, set] = defaultdict(set)
-    for path in (REPO_ROOT / "db" / "migrations").glob("*.sql"):
+    for path in _fixture_migration_paths():
         # Noise stripped BEFORE the regexes run, so a comma inside a comment or a
         # string literal cannot split a column definition and a `--` cannot be
         # read as a column name.
@@ -631,7 +664,7 @@ def _columns_declared_by_migrations() -> Dict[str, set]:
 
 
 def _apply_migrations(raw) -> Tuple[int, int]:
-    """Apply db/migrations/*.sql in version order. Returns (applied, failed).
+    """Apply `_fixture_migration_paths()` in version order. Returns (applied, failed).
 
     Failures are tolerated: a dozen migrations target tables this repo creates
     from application code rather than DDL, and a migration that cannot apply
@@ -654,11 +687,7 @@ def _apply_migrations(raw) -> Tuple[int, int]:
     from psycopg2 import extensions
 
     applied = failed = 0
-    paths = sorted(
-        (REPO_ROOT / "db" / "migrations").glob("*.sql"),
-        key=lambda p: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.name)],
-    )
-    for path in paths:
+    for path in _fixture_migration_paths():
         cursor = raw.cursor()
         body = path.read_text(encoding="utf-8")
         try:
@@ -1390,6 +1419,43 @@ def test_the_sweep_detects_each_failure_mode_it_claims_to(prepare) -> None:
     prepare(
         "INSERT INTO catalog_products (product_key) VALUES (:pk) ON CONFLICT DO NOTHING"
     )
+
+
+def test_hand_applied_migrations_are_in_the_fixture_and_retired_ones_are_not(prepare) -> None:
+    """260/261 are `*.sql.disabled` so the boot runner never applies them, yet
+    production has them (by hand). The fixture must too, or the backfill
+    script's statements fail here as UndefinedColumnError:real -- which is how
+    this was found (#2551, run 38048734575). And the retired `.disabled` files
+    must stay out: production does not have THEIR tables.
+    """
+    from db.sql_migrations import list_migration_files
+
+    names = [p.name for p in _fixture_migration_paths()]
+    assert "260_catalog_products_own_name_norm.sql.disabled" in names
+    assert "261_catalog_products_name_norm_trgm_index.sql.disabled" in names
+    # Exact names: 014/015/017 have ACTIVE successors under the same number.
+    for retired in ("002_production_tables", "007_agents_management_upgrade",
+                    "014_dual_sided_revenue", "015_agent_portal_settlement",
+                    "017_agent_payout_comprehensive"):
+        assert (REPO_ROOT / "db" / "migrations" / f"{retired}.sql.disabled").exists(), retired
+        assert f"{retired}.sql.disabled" not in names, retired
+    assert sum(n.endswith(".sql.disabled") for n in names) == 2
+    # Every active file is in, in version order, with 260 placed by its number.
+    active = [Path(p).name for p in list_migration_files(str(REPO_ROOT))]
+    assert set(active) <= set(names)
+    assert names == sorted(names, key=lambda n: _version_key(Path(n)))
+    # And the boot runner's own list is untouched by this: it still never sees them.
+    assert not any(n.startswith(("260_", "261_")) for n in active)
+
+    # The thing it buys: the schema production has. Column census and build agree,
+    # so a column error against catalog_products is a verdict, not a fixture gap...
+    assert "catalog_products" in prepare.faithful_tables
+    declared = _columns_declared_by_migrations()["catalog_products"]
+    assert {"name_norm", "own_name_norm"} <= declared
+    # ...and the backfill script's shapes plan.
+    prepare("SELECT name_norm, own_name_norm FROM catalog_products WHERE product_key = :pk")
+    prepare("SELECT count(*) FROM catalog_products WHERE name_norm IS NULL OR own_name_norm IS NULL")
+    prepare("SELECT catalog_products_identity_fold(CAST(:s AS text))")
 
 
 def test_a_fixture_gap_is_reported_as_unchecked_not_as_a_pass(prepare) -> None:

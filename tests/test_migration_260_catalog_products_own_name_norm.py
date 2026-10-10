@@ -15,8 +15,12 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-UP_260 = REPO / "db" / "migrations" / "260_catalog_products_own_name_norm.sql"
-UP_261 = REPO / "db" / "migrations" / "261_catalog_products_name_norm_trgm_index.sql"
+# *.sql.disabled: deploys skip startup migrations (main.startup returns early in fast mode,
+# SKIP_HEAVY_STARTUP_INIT=true on every Cloud Run deploy), so these two are applied by hand, in order,
+# from a one-off job; the suffix also keeps them out of the boot runner in any environment that runs
+# the full startup, which applies every ACTIVE *.sql file it has not ledgered, with no lock_timeout.
+UP_260 = REPO / "db" / "migrations" / "260_catalog_products_own_name_norm.sql.disabled"
+UP_261 = REPO / "db" / "migrations" / "261_catalog_products_name_norm_trgm_index.sql.disabled"
 DOWN_260 = REPO / "db" / "migrations" / "down" / "260_catalog_products_own_name_norm_down.sql"
 DOWN_261 = REPO / "db" / "migrations" / "down" / "261_catalog_products_name_norm_trgm_index_down.sql"
 
@@ -36,6 +40,35 @@ CARRIER_INPUTS = "concat_ws(' ', NEW.title, NEW.product_type)"
 
 def _sql(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def test_both_files_are_invisible_to_the_boot_runner_and_say_why() -> None:
+    from db.sql_migrations import (
+        HAND_APPLIED_MARKER, list_hand_applied_migration_files, list_migration_files, needs_autocommit,
+    )
+
+    active = {Path(f).name for f in list_migration_files(str(REPO))}
+    # The schema-rebuilding test fixtures (tests/test_repo_sql_prepare_postgres.py) apply these two
+    # in version order with the active files, keyed on the first-line marker: production has them, so SQL written
+    # against their columns must be planned against a schema that has them. The retired .disabled
+    # files carry no marker and stay out of everything.
+    assert HAND_APPLIED_MARKER == "-- HAND-APPLIED ONLY"
+    assert [Path(f).name for f in list_hand_applied_migration_files(str(REPO))] == [UP_260.name, UP_261.name]
+    assert not (set(Path(f).name for f in list_hand_applied_migration_files(str(REPO))) & active)
+    assert UP_260.exists() and UP_261.exists()
+    for name in ("260_catalog_products_own_name_norm.sql", "261_catalog_products_name_norm_trgm_index.sql"):
+        assert name not in active, f"{name} would be applied by any environment that runs the full startup"
+        assert not (REPO / "db" / "migrations" / name).exists()
+    assert not any(n.startswith(("260_", "261_")) for n in active)
+    # The hand-apply still runs them the way the runner would classify them: 260 in one transaction,
+    # 261 statement-at-a-time on autocommit.
+    assert needs_autocommit(_sql(UP_260)) is False
+    assert needs_autocommit(_sql(UP_261)) is True
+    for path in (UP_260, UP_261):
+        head = _sql(path).splitlines()[0]
+        assert head.startswith("-- HAND-APPLIED ONLY"), path.name
+    assert "lock_timeout = '3s'" in _sql(UP_260)
+    assert "AFTER the backfill" in _sql(UP_261) and "indisvalid" in _sql(UP_261)
 
 
 def test_the_fold_function_is_the_gateways_identity_sql_character_for_character() -> None:
