@@ -1,7 +1,13 @@
--- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing): the boot runner would otherwise build
--- this index on the next deploy, BEFORE the backfill. Apply it from a one-off job AFTER the backfill
--- has reached `remaining: 0`, on an autocommit connection statement at a time (the build runs outside
--- a transaction), and check pg_index.indisvalid afterwards. See #2549 / #2404.
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). Prod deploys do NOT run startup
+-- migrations (main.startup() returns early in fast mode, SKIP_HEAVY_STARTUP_INIT='true', which the
+-- infra/gcp deploy scripts set on EVERY Cloud Run deploy, prod and staging, before
+-- db.sql_migrations.run_sql_migrations), so no deploy applies this file. It is
+-- applied by hand, from a one-off job, in order: 260 first, then this file AFTER the backfill has
+-- reached `remaining: 0`, on an autocommit connection statement at a time (the build runs outside a
+-- transaction); check pg_index.indisvalid afterwards. See #2549 / #2404. The .disabled suffix also keeps
+-- the file out of the boot runner and its ledger in any environment that DOES run the full startup
+-- (local, CI, SKIP_HEAVY_STARTUP_INIT=false), the same way 260 stays out, so the two are always applied
+-- together, by hand, in order.
 --
 -- 261: trigram index on catalog_products.name_norm (the column migration 260 stamps), for the
 -- gateway's name-evidence carrier CTE (PIVOTA-Agent #2404).
