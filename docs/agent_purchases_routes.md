@@ -80,8 +80,8 @@ rather than leaving that purchase out (a missing row would read as a purchase th
      idempotent and safe beside live traffic): `python scripts/backfill_agent_purchases.py --dry-run`,
      then without `--dry-run`.
   2. Set `AGENT_PURCHASE_LEDGER_ENABLED=1`. From then on the Reap create route writes each new
-     purchase's parent after its own commit (best-effort, at most 1 s; a failure or a timeout is
-     logged and never affects the purchase).
+     purchase's parent after its own commit (best-effort and bounded at 1 s on Postgres; a failure
+     or a timeout is logged and never affects the purchase).
   3. Run the backfill once more for purchases opened between steps 1 and 2.
   Reads also heal: a single read heals that purchase, and a list read heals that owner's newest 100.
 - Turn off: unset the dial. The table stays; nothing reads or writes it.

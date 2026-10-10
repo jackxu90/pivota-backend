@@ -2557,9 +2557,11 @@ async def _record_purchase_parent(purchase_id: str) -> None:
     parent is derived entirely from the committed purchase row, so a parent that is not written
     here is written by the unified read's heal or by the backfill, and a fault in this table can
     never fail, delay or roll back a purchase. Dark unless AGENT_PURCHASE_LEDGER_ENABLED is on.
-    BOUNDED: it is awaited inside the 202 path, so a stalled ledger write (a held SQLite writer, queued
-    DDL, an exhausted pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of
-    holding the agent's response. An idempotent replay returns before this hook and a duplicate loser
+    BOUNDED: it is awaited inside the 202 path, so a stalled ledger write (queued DDL, an exhausted
+    pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of holding the
+    agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
+    or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
+    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent replay returns before this hook and a duplicate loser
     never reaches it; both get their parent from the heal or the backfill.
     """
     if not agent_purchase_ledger.is_enabled():

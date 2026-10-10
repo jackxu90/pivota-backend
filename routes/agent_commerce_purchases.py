@@ -72,7 +72,7 @@ async def _parent_for(purchase_id: str, agent_id: str, owner: str) -> Optional[D
     try:
         if purchase_id.startswith("pp_"):
             return await purchases.get_for_owner(purchase_id, agent_id, owner)
-        rail = RAIL_ID_PREFIX.get(purchase_id[:3])
+        rail = next((r for prefix, r in RAIL_ID_PREFIX.items() if purchase_id.startswith(prefix)), None)
         if rail != "reap":
             return None
         parent = await purchases.get_by_rail_id_for_owner(rail, purchase_id, agent_id, owner)

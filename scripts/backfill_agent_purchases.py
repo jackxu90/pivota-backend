@@ -33,7 +33,10 @@ async def run(args: argparse.Namespace) -> int:
     await database.connect()
     try:
         if args.dry_run:
-            print(f"missing_parents={await ledger.count_missing_reap_parents()}")
+            try:
+                print(f"missing_parents={await ledger.count_missing_reap_parents()}")
+            except Exception as exc:  # noqa: BLE001 - before the first boot's self-heal the table is absent
+                print(f"missing_parents=unknown ({type(exc).__name__}: is agent_purchases built yet?)")
             return 0
         await ledger.ensure_agent_purchase_schema()
         total = 0

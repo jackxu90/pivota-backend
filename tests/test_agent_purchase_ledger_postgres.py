@@ -81,10 +81,12 @@ async def _fingerprint():
             "WHERE schemaname = 'public' AND tablename = 'agent_purchases'"
         )
     }
+    # NAMES and definitions: the CHECKs are named so the next rail's migration can replace them by
+    # name, so a name that drifts between the migration and the self-heal must fail here.
     checks = sorted(
-        r["def"] for r in await database.fetch_all(
+        (r["conname"], r["def"]) for r in await database.fetch_all(
             """
-            SELECT pg_get_constraintdef(c.oid) AS def
+            SELECT c.conname, pg_get_constraintdef(c.oid) AS def
               FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
              WHERE t.relname = 'agent_purchases' AND c.contype = 'c'
             """
@@ -114,6 +116,7 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_263():
         await database.execute(statement)
     from_migration = await _fingerprint()
     assert from_migration[0] and from_migration[1] and from_migration[2]
+    assert [name for name, _def in from_migration[2]] == ["ck_agent_purchases_executor", "ck_agent_purchases_rail"]
 
     await database.execute("DROP TABLE IF EXISTS agent_purchases")
     await purchases.ensure_agent_purchase_schema()
