@@ -298,8 +298,9 @@ def validate_options(options: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"options.source = shopify_markets captures the {' and '.join(CAPTURE_MARKETS)} "
                              f"markets only")
         if options.get("source_role") != "brand_official" and job_market(options) != "SG":
-            # Brand stores first (Peng 2026-09-26) still holds for the US: US retailers follow later. SG retailers are allowed (Peng 2026-10-10, "Build the SG currency
-            # support": nearly every SG pair the coverage wave found is a retailer). The gate is the
+            # Brand stores first (Peng 2026-09-26) still holds for the US: US retailers follow later.
+            # SG retailers are allowed (Peng 2026-10-10, "Build the SG currency support": nearly every SG
+            # pair the coverage wave found is a retailer). The gate is the
             # MARKET, in code, not an env or a job option: an env would have to match on the enqueue runner
             # and on the drain (whose image and env have a single writer), and a job option is the operator
             # vouching for themselves. A retailer sibling copies the retailer's own seller identity from its
@@ -1618,7 +1619,8 @@ async def _run_markets_stage(job: Dict[str, Any], run_id: str, stage: str, timin
               + (f"{readback.get('served_content_keys', 0)} content_key(s) serving" if market == DEFAULT_MARKET
                  # A USD retailer's content_key already serves through its US base offers, so a serving
                  # count is no evidence about SG (review of #2553): the reason claims only what was checked.
-                 else f"{readback.get('served_content_keys', 0)} content_key(s) re-published")
+                 else f"{len({r['content_key'] for r in wrote['written'] if r.get('content_key')})} "
+                      f"content_key(s) re-published")
               + (f"; {applied['not_written']} not written" if applied["not_written"] else "")
               if ok else f"{outcome}: {readback.get('problems')}")
     await _move(job, status="done" if ok else "failed", run_id=run_id, reason=reason[:2000], db=db)

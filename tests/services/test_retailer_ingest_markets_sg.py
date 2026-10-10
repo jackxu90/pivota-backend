@@ -517,6 +517,9 @@ async def test_a_usd_retailer_becomes_sg_servable_through_sgd_siblings(sg_lane):
     assert run["checks"]["markets_capture"]["cart_currency"] == "SGD"
     assert run["readback"]["ok"] and run["readback"]["served_content_keys"] >= 1
     assert "SGD sibling offer(s)" in env.ledger.transitions[-1]["reason"]
+    # A USD retailer's key already serves through its US base offers, so the SG reason never claims "serving".
+    assert "content_key(s) re-published" in env.ledger.transitions[-1]["reason"]
+    assert "serving" not in env.ledger.transitions[-1]["reason"]
     siblings = catalog.offers("market = 'SG'")
     assert len(siblings) == len(base)
     assert {(o["currency"], o["source_system"], o["source_domain"]) for o in siblings} == {
@@ -594,3 +597,21 @@ async def test_the_base_crawl_ships_to_gate_writes_nothing_for_a_store_that_does
     assert out["status"] == "apply_due"
     assert list(env.ledger.runs.values())[-1]["checks"]["storefront"]["ships_to_market"] is (
         None if ships is None else False)
+
+
+def test_the_ships_to_gate_is_not_part_of_the_cohort():
+    # Re-enqueueing an open base cohort with the gate answers `exists` instead of opening a second job over the
+    # same rows (review of #2553). To apply the gate to an open job, cancel it first.
+    from db import retailer_ingest as ledger
+    o = {"retailer_name": "K-Beauty Retailer"}
+    assert (ledger.scope_key("kbeauty-retailer.example.com", "COSRX", o)
+            == ledger.scope_key("kbeauty-retailer.example.com", "COSRX", {**o, "require_ships_to_market": True}))
+
+
+@pytest.mark.parametrize("role,retailer", [(None, True), ("retailer", True), ("Retailer", True), ("", True),
+                                           ("brand_official", False)])
+def test_anything_but_a_brand_store_is_a_retailer_job(role, retailer):
+    # The same test validate_options gates SG retailers on: a stored role that is neither value is never
+    # allowed as a retailer and then selected as a brand store.
+    options = {"source": "shopify_markets", "market": "SG"} | ({} if role is None else {"source_role": role})
+    assert markets.is_retailer_job({"options": options}) is retailer

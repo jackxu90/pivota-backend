@@ -25,7 +25,9 @@ JP for a JPY store; a CAD/GBP/KRW store has none yet), with "require_ships_to_ma
   2. {"domain": "kbeauty-retailer.example.com", "brand": "COSRX", "vendors": ["COSRX"],
       "options": {"source": "shopify_markets", "market": "SG"}}                       -- SGD siblings
 
-Re-enqueueing a cohort that already has an open job is a no-op (reported as `exists`).
+Re-enqueueing a cohort that already has an open job is a no-op (reported as `exists`). require_ships_to_market
+is a gate, not part of the cohort: re-enqueueing an open base job WITH it also answers `exists` and the open job
+runs without the gate -- cancel the open job first to apply it.
 Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh.
 
     python -m scripts.enqueue_retailer_ingest --file cohorts.jsonl --source meitu_lip_2026_09
