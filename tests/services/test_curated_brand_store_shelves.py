@@ -154,13 +154,49 @@ def test_the_head_noun_names_the_product_on_a_measured_title_host(domain, ptype,
     assert resolve(ptype, title, domain) == (want, HEAD)
 
 
+# Read 2026-10-10: the SOS Daily Rescue Facial Spray is tower28's only spray, and its body wash names
+# the body. Both were unresolved, so the drain left them out (#2403 pinned them as refusals).
+@pytest.mark.parametrize("title,want", [
+    ("SOS Rescue Spray", "beauty/skincare/tone/toner"),
+    ("SOS Rescue Spray - Standard Size", "beauty/skincare/tone/toner"),
+    ("Travel SOS Rescue Spray", "beauty/skincare/tone/toner"),
+    ("SOS Rescue + Relief Body Wash Treatment", "beauty/body/care"),
+])
+def test_tower28s_facial_spray_and_body_wash_resolve(title, want):
+    assert resolve("", title, "tower28beauty.com") == (want, HEAD)
+
+
+@pytest.mark.parametrize("domain,ptype,title,want", [
+    # the host's "spray" head is never another product's: each is constructed
+    ("tower28beauty.com", "", "Setting Spray", None),
+    ("tower28beauty.com", "", "Makeup Setting Spray", None),
+    ("tower28beauty.com", "", "Hair Spray", None),
+    ("tower28beauty.com", "", "Body Spray", None),
+    ("tower28beauty.com", "", "Room & Linen Spray", None),
+    # ...a pattern that names something keeps its answer
+    ("tower28beauty.com", "", "SunnyDays SPF 30 Sunscreen Spray", "beauty/skincare/sun/sunscreen"),
+    # ...a typed shelf is not the blank type the spray head was read on
+    ("tower28beauty.com", "Foundations & Concealers", "SOS Rescue Spray", None),
+    # ...and the spray head is tower28's alone
+    ("stilacosmetics.com", "", "Rescue Spray", None),
+    # a makeup head that names the body stays refused (no body leaf for makeup)
+    ("tower28beauty.com", "", "SuperDew Body Highlighter", None),
+])
+def test_the_spray_head_and_the_body_area_answer_stay_narrow(domain, ptype, title, want):
+    got = resolve(ptype, title, domain)
+    if want is None:
+        assert unresolved(got)
+    else:
+        assert got[0] == want
+
+
 @pytest.mark.parametrize("domain,ptype,title", [
     # review of #2403: the head of the whole title is not the product
     ("stilacosmetics.com", "Sale", "Convertible Color™ Dual Lip & Cheek Cream"),
     ("stilacosmetics.com", "Sale", "Stay All Day® Foundation & Concealer"),
     ("stilacosmetics.com", "Sale", "Calligraphy Lip Stain in Michelle (Warm Blush)"),
     ("stilacosmetics.com", "", "Free Mini HUGE Extreme Lash Mascara"),
-    ("tower28beauty.com", "", "SOS Rescue + Relief Body Wash Treatment"),
+    ("tower28beauty.com", "", "SOS Face & Body Wash"),        # constructed: the face is named too
     ("tower28beauty.com", "", "MakeWaves Lash Primer"),
     ("tower28beauty.com", "", "ShineOn Lip Primer"),
     ("tower28beauty.com", "", "GetSet Brow Powder"),
@@ -208,7 +244,8 @@ def test_the_head_noun_rule_leaves_lip_rows_to_the_lip_door_and_its_hold():
     ("", "The Cheeky Duo"),
     ("", "Keep-It Together Keychain"),                    # merch
     ("", "$10 Gift Card"),
-    ("", "SOS Rescue Spray"),                             # names no leaf
+    ("", "SOS Rescue Spray Refill"),                      # a refill
+    ("", "SOS Spray Duo"),                                # a duo
     ("", "MakeWaves Mascara Trio"),                       # constructed: a set word no gift-set pattern reads
     ("", "MakeWaves Mascara Holiday Edition"),            # constructed: the gift-set pattern, no set word
     ("Hidden", "Free Mini HUGE Extreme Lash Mascara"),    # a type nobody listed

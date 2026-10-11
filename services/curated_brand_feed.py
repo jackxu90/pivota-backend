@@ -2155,6 +2155,17 @@ _TITLE_ACCESSORY_OR_GIVEAWAY = re.compile(
     r"\b(?:free|gwp|brush(?:es)?|sharpeners?|applicators?|cases?|holders?|pouch(?:es)?|mirrors?|removers?|"
     r"wipes?|organi[sz]ers?|bags?|totes?|clips?|tees?|t-?shirts?|shirts?|hoodies?|crewnecks?|sweatshirts?|"
     r"hats?|caps?|refills?|wands?)\b", re.I)
+# A measured host's own head noun that no CATEGORY_PATTERNS entry reads. Read 2026-10-10: tower28's
+# only "spray" is the SOS Daily Rescue Facial Spray (singles, a travel size, a refill and a duo, all
+# with a blank type). A facial mist is a toner here: the Toner pattern already claims "mist", and the
+# gateway's canonical leaf is tone/toner. Consulted ONLY where no pattern names anything, only on a
+# blank type, and never past the veto below -- a setting, hair, body, sun or scented spray is another
+# product, and the taxonomy has no setting-spray leaf (TAXONOMY_GAPS).
+_MEASURED_TITLE_HOST_HEADS = {
+    "tower28beauty.com": (("beauty/skincare/tone/toner", re.compile(r"\bspray\b", re.I)),),
+}
+_HOST_HEAD_VETO = re.compile(r"\b(?:setting|set|fix(?:er|ing)?|make\s*-?up|finishing|hair|scalp|body|hands?|"
+                             r"sun|spf|uv|tan(?:ning)?|perfume|parfum|fragrance|scent(?:ed)?|room|linen)\b", re.I)
 
 
 def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[str],
@@ -2176,6 +2187,12 @@ def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[s
             if path not in spans or m.end() > spans[path][1]:
                 start = m.start(1) if m.lastindex and m.start(1) >= 0 else m.start()
                 spans[path] = (start, m.end())
+    if not spans and not ptype and not _HOST_HEAD_VETO.search(text):
+        for path, pattern in _MEASURED_TITLE_HOST_HEADS.get(host, ()):
+            m = pattern.search(name)
+            if m:
+                spans[path] = (m.start(), m.end())
+                break
     if not spans:
         return None
     # the leaf whose match ends last; a tie, like a named gift set, is a second leaf and refused below
@@ -2191,7 +2208,11 @@ def _measured_host_title_leaf(*, domain: Optional[str], product_type: Optional[s
         return None  # a leaf with no area row (nails, lashes...) is not this rule's to place
     # over the WHOLE title: a suffix can name another area ("Highlighter (Face & Body)")
     if any(pattern.search(text) for area, pattern in _TITLE_AREA_WORDS.items() if area not in allowed):
-        return None
+        # A FACE skincare head on a product naming another body area is that area's product: the
+        # body-area guard's own answer, as for every other writer ("SOS Rescue + Relief Body Wash
+        # Treatment" -> body/care). Where the guard has no honest leaf, or the face is named too
+        # ("Face & Body Wash"), or the head is makeup ("Body Highlighter"), it stays refused.
+        return non_face_leaf(head, text) or None
     return head
 
 
