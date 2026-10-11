@@ -83,6 +83,7 @@ and no values — and it is mapped to a bare reason code below rather than forwa
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -97,6 +98,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr, model_validator
 
+import db.agent_purchase_ledger as agent_purchase_ledger
 import db.reap_agentic_ledger as ledger
 import db.reap_continuation as continuation
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
@@ -2544,6 +2546,38 @@ async def _owner_public_body(row):
     return body
 
 
+#: The most the post-commit parent write may add to the create's 202 (see `_record_purchase_parent`).
+_RECORD_PARENT_TIMEOUT_S = 1.0
+
+
+async def _record_purchase_parent(purchase_id: str) -> None:
+    """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
+
+    AFTER this route's own transaction has committed, never inside it, and it never raises: the
+    parent is derived entirely from the committed purchase row, so a parent that is not written
+    here is written by the unified read's heal or by the backfill, and a fault in this table can
+    never fail, delay or roll back a purchase. Dark unless AGENT_PURCHASE_LEDGER_ENABLED is on.
+    BOUNDED: it is awaited inside the 202 path, so a stalled ledger write (queued DDL, an exhausted
+    pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of holding the
+    agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
+    or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
+    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent replay returns before this hook and a duplicate loser
+    never reaches it; both get their parent from the heal or the backfill.
+    """
+    if not agent_purchase_ledger.is_enabled():
+        return
+    try:
+        await asyncio.wait_for(
+            agent_purchase_ledger.ensure_reap_parent(purchase_id), timeout=_RECORD_PARENT_TIMEOUT_S
+        )
+    except Exception as exc:  # noqa: BLE001 (TimeoutError included)
+        logger.warning(
+            "reap_agentic: agent_purchases parent not written purchase=%s error_type=%s",
+            purchase_id,
+            type(exc).__name__,
+        )
+
+
 def _not_found() -> JSONResponse:
     """WRONG OWNER AND NO SUCH PURCHASE ARE THE SAME ANSWER. 404, never 403: a 403 confirms the
     id exists, which turns this endpoint into an oracle for guessing other buyers' purchase ids.
@@ -3077,6 +3111,7 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
+        await _record_purchase_parent(purchase_id)
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],
