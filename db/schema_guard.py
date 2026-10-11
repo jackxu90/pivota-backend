@@ -3173,6 +3173,16 @@ async def ensure_required_schema_light() -> None:
                 "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
                 "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
             )
+            # mig 263: per-currency price summary on the served view, and the
+            # stamp tying it to the write that produced it
+            # (services/agent_pdp_view_assembler.build_market_prices). Nullable,
+            # written only while AGENT_PDP_VIEW_MARKET_PRICES is on; readers use
+            # the summary only while its stamp equals refreshed_at.
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS market_prices JSONB, "
+                "ADD COLUMN IF NOT EXISTS market_prices_refreshed_at TIMESTAMPTZ;"
+            )
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
             # identical content under a self-referential canonical tag. The

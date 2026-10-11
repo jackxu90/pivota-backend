@@ -11,18 +11,30 @@ import logging
 import os
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 
 from db.database import database
-from services.agent_pdp_view_assembler import normalize_taxonomy_tags
+from services.agent_pdp_view_assembler import (
+    agent_pdp_view_has_market_prices,
+    is_missing_market_prices_column_error,
+    mark_market_prices_columns_missing,
+    market_prices_entry,
+    market_prices_fresh_sql,
+    normalize_taxonomy_tags,
+)
 from services.catalog_identity import is_content_key
 from services.catalog_sync_service import pivota_canonical_pdp_url
 from services.claim_safety import substantiated_claims
 from services.independent_signals import independent_signals_for
-from services.offer_buyability import DEFAULT_SERVING_MARKET, annotate_offer_buyability
+from services.offer_buyability import (
+    DEFAULT_SERVING_MARKET,
+    annotate_offer_buyability,
+    expected_currency_for_market,
+)
 from services.pdp_renderability import sig_pdp_will_render_sql
 from services.serving_freshness import serving_freshness
+from utils.market_code import iso2_market
 
 
 router = APIRouter(prefix="/api/agent/pdp", tags=["agent-pdp"])
@@ -33,6 +45,41 @@ def _serving_market() -> str:
     """Market this read surface serves buyability against. US-oriented index by
     default; override with AGENT_PDP_SERVING_MARKET for a non-US deployment."""
     return (os.getenv("AGENT_PDP_SERVING_MARKET") or DEFAULT_SERVING_MARKET).strip() or DEFAULT_SERVING_MARKET
+
+
+def _normalize_buyer_market(raw: Any) -> Optional[str]:
+    """The buyer's market this route honours, else None (the deployment's market applies, as
+    before). Only behind AGENT_PDP_V1_MARKET_PRICES_READ, and only a SERVED pricing region
+    (PIVOTA_SERVING_PRICING_REGIONS): an acquisition market (JP, AU -- stored, never served) or any
+    other code must not turn a stored foreign offer into a buy pick. ISO-2 parsing is the search
+    routes' (routes/agent_api._normalize_serving_market_param): a locale, a list or an unpriced
+    code makes no claim."""
+    if not _market_prices_read_enabled():
+        return None
+    code = iso2_market(raw)
+    if not code or not expected_currency_for_market(code):
+        return None
+    from services.index_pipeline_state_service import serving_pricing_regions
+
+    return code if code in serving_pricing_regions() else None
+
+
+def _needs_market_view(buyer_market: Optional[str]) -> bool:
+    """A buyer priced in another currency than the deployment's: the only case that reads the
+    per-currency summary. A US buyer on the US deployment never names the column."""
+    if not buyer_market:
+        return False
+    currency = expected_currency_for_market(buyer_market)
+    return bool(currency) and currency != expected_currency_for_market(_serving_market())
+
+
+def _market_prices_read_enabled() -> bool:
+    """Read flag for agent_pdp_view.market_prices (migration 263). Default OFF: the SELECTs do
+    not name the column, so the route keeps working on a database without it."""
+    return (
+        (os.getenv("AGENT_PDP_V1_MARKET_PRICES_READ") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
 
 
 AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
@@ -208,6 +255,50 @@ BYPASS_SELECT_BY_PRODUCT_GROUP_SQL = f"""
 """
 
 
+def _with_market_prices(sql: str) -> str:
+    """The same SELECT plus the summary, appended after the last agent_pdp_view column
+    (required_disclaimers) of either SELECT shape -- through market_prices_fresh_sql, so a
+    summary a later flag-off write left behind reads as NULL."""
+    gated = "apv.required_disclaimers,\n"
+    bypass = "      required_disclaimers\n    FROM"
+    if sql.count(gated) == 1:
+        return sql.replace(
+            gated, f"apv.required_disclaimers,\n      {market_prices_fresh_sql('apv')} AS market_prices,\n"
+        )
+    if sql.count(bypass) == 1:
+        return sql.replace(
+            bypass, f"      required_disclaimers,\n      {market_prices_fresh_sql()} AS market_prices\n    FROM"
+        )
+    raise RuntimeError("agent_pdp_v1 SELECT changed shape; update _with_market_prices")
+
+
+# Built once at import, so a shape change fails at boot rather than per request.
+_MARKET_PRICES_SQL = {
+    sql: _with_market_prices(sql)
+    for sql in (
+        SELECT_BY_CONTENT_KEY_SQL, SELECT_BY_SIGNATURE_SQL, SELECT_BY_PRODUCT_GROUP_SQL,
+        INDEX_SELECT_BY_CONTENT_KEY_SQL, INDEX_SELECT_BY_SIGNATURE_SQL,
+        INDEX_SELECT_BY_PRODUCT_GROUP_SQL,
+        BYPASS_SELECT_BY_CONTENT_KEY_SQL, BYPASS_SELECT_BY_SIGNATURE_SQL,
+        BYPASS_SELECT_BY_PRODUCT_GROUP_SQL,
+    )
+}
+_LEGACY_SQL = {variant: legacy for legacy, variant in _MARKET_PRICES_SQL.items()}
+
+
+async def _fetch_view_row(query: str, values: Dict[str, Any]) -> Any:
+    """fetch_one, and if a market_prices SELECT finds the columns missing (dropped, or the probe
+    raced the heal), the legacy SELECT for this request and the legacy path until re-probed."""
+    try:
+        return await database.fetch_one(query, values)
+    except Exception as exc:
+        legacy = _LEGACY_SQL.get(query)
+        if legacy is None or not is_missing_market_prices_column_error(exc):
+            raise
+        mark_market_prices_columns_missing()
+        return await database.fetch_one(legacy, values)
+
+
 def _is_pivota_signature_id(value: str) -> bool:
     return value.startswith("sig_")
 
@@ -290,6 +381,23 @@ def _warn_serving_eligibility_bypass(request: Request, lookup_id: str) -> None:
 
 
 def _query_for_id(
+    value: str,
+    *,
+    bypass_serving_eligibility: bool = False,
+    index_eligible_read: bool = False,
+    market_prices_read: bool = False,
+) -> Optional[str]:
+    sql = _base_query_for_id(
+        value,
+        bypass_serving_eligibility=bypass_serving_eligibility,
+        index_eligible_read=index_eligible_read,
+    )
+    if sql is not None and market_prices_read:
+        return _MARKET_PRICES_SQL[sql]
+    return sql
+
+
+def _base_query_for_id(
     value: str,
     *,
     bypass_serving_eligibility: bool = False,
@@ -383,6 +491,8 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
         "bullet_points", "usage_scenarios",
     ):
         data[key] = _coerce_json(data.get(key))
+    if "market_prices" in data:
+        data["market_prices"] = _coerce_json(data.get("market_prices"))
 
     data["image_urls"] = _coerce_list(data.get("image_urls"))
     data["offers"] = _coerce_list(data.get("offers"))
@@ -399,6 +509,8 @@ def _row_as_product(row: Dict[str, Any]) -> Dict[str, Any]:
     product_id = row.get("pivota_signature_id") or row.get("content_key")
 
     product = dict(row)
+    # Internal read model, never served as-is: _market_view applies it.
+    product.pop("market_prices", None)
     product.update(
         {
             "id": product_id,
@@ -518,14 +630,47 @@ def aggregate_rating_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _market_view(row: Dict[str, Any], buyer_market: Optional[str]) -> Dict[str, Any]:
+    """The row as the BUYER's market sees it.
+
+    Only for a buyer priced in another currency than the deployment's (_needs_market_view), and
+    only when the row carries a FRESH version-1 summary with an entry in that currency
+    (agent_pdp_view.market_prices, migration 263; the SELECT nulls a stale one): currency,
+    price_min, price_max, offer_count and offers are that currency's -- the same values the
+    gateway serves from the same summary. Never converted. Any other case returns the row as is,
+    so those responses are byte-identical to the route without this function.
+    """
+    if not _needs_market_view(buyer_market):
+        return row
+    currency = expected_currency_for_market(buyer_market)
+    entry = market_prices_entry(row.get("market_prices"), currency)
+    if entry is None:
+        return row
+    view = dict(row)
+    view.update(
+        {
+            "currency": currency,
+            "price_min": entry.get("price_min"),
+            "price_max": entry.get("price_max"),
+            "offer_count": entry.get("offer_count"),
+            "offers": [o for o in (entry.get("offers") or []) if isinstance(o, dict)],
+        }
+    )
+    return view
+
+
 def _build_response(
     row: Dict[str, Any],
     independent_signals: Optional[list] = None,
+    buyer_market: Optional[str] = None,
 ) -> Dict[str, Any]:
+    row = _market_view(row, buyer_market)
     # Market-aware buyability: tag each offer domestic/cross_border + is_buy_pick
-    # against the serving market so a cross-border brand-direct offer (e.g. a KRW
-    # listing) isn't presented to a US agent as a domestic same-market purchase.
-    offers = annotate_offer_buyability(row.get("offers") or [], _serving_market())
+    # against the BUYER's market when the request names one it can price
+    # (`serving_market`), else the deployment's, so a cross-border brand-direct offer
+    # (e.g. a KRW listing) isn't presented to a US agent as a domestic same-market
+    # purchase, and an SG buyer's buy pick is an SGD offer when the row has one.
+    offers = annotate_offer_buyability(row.get("offers") or [], buyer_market or _serving_market())
     offer_count = row.get("offer_count")
     if offer_count is None:
         offer_count = len(offers)
@@ -569,18 +714,32 @@ def _build_response(
     return jsonable_encoder(payload)
 
 
-async def _respond(row: Dict[str, Any]) -> Dict[str, Any]:
+async def _respond(row: Dict[str, Any], buyer_market: Optional[str] = None) -> Dict[str, Any]:
     """Build the PDP response, enriched with credible independent signals (one
     indexed lookup on content_key; [] for the common no-citation case)."""
     signals = await independent_signals_for(str(row.get("content_key") or ""), db=database)
-    return _build_response(row, independent_signals=signals)
+    return _build_response(row, independent_signals=signals, buyer_market=buyer_market)
 
 
 @router.get("/{id}")
-async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
+async def get_agent_pdp(
+    id: str,
+    request: Request,
+    serving_market: Optional[str] = Query(
+        default=None,
+        description=(
+            "The BUYER's market (ISO-2), as on the search routes. Honoured only for a served "
+            "pricing region while AGENT_PDP_V1_MARKET_PRICES_READ is on: it decides the buy pick "
+            "and, when the row carries a fresh per-currency summary, the price block, offers and "
+            "offers_count. Anything else is ignored (the deployment's market applies)."
+        ),
+    ),
+) -> Dict[str, Any]:
     raw_id = str(id or "")
+    buyer_market = _normalize_buyer_market(serving_market)
     bypass_serving_eligibility = _bypass_serving_eligibility()
     index_eligible_read = _index_eligible_read_enabled()
+    market_prices_read = _needs_market_view(buyer_market) and await agent_pdp_view_has_market_prices(database)
     if bypass_serving_eligibility:
         _warn_serving_eligibility_bypass(request, raw_id)
 
@@ -598,28 +757,27 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
             resolved_content_key,
             bypass_serving_eligibility=bypass_serving_eligibility,
             index_eligible_read=index_eligible_read,
+            market_prices_read=market_prices_read,
         )
         if query is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="PDP not found",
             )
-        row = await database.fetch_one(
-            query,
-            {"id": resolved_content_key},
-        )
+        row = await _fetch_view_row(query, {"id": resolved_content_key})
         if not row:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="PDP not found",
             )
-        return await _respond(_row_to_dict(row))
+        return await _respond(_row_to_dict(row), buyer_market)
 
     lookup_id = _strip_group_wrapper(raw_id)
     query = _query_for_id(
         lookup_id,
         bypass_serving_eligibility=bypass_serving_eligibility,
         index_eligible_read=index_eligible_read,
+        market_prices_read=market_prices_read,
     )
     if query is None:
         raise HTTPException(
@@ -627,7 +785,7 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
             detail="PDP not found",
         )
 
-    row = await database.fetch_one(query, {"id": lookup_id})
+    row = await _fetch_view_row(query, {"id": lookup_id})
     if not row and _is_pivota_signature_id(lookup_id):
         resolved = await database.fetch_one(SIG_RESOLVE_SQL, {"id": lookup_id})
         resolved_content_key = str(dict(resolved).get("content_key") or "") if resolved else ""
@@ -635,13 +793,14 @@ async def get_agent_pdp(id: str, request: Request) -> Dict[str, Any]:
             resolved_content_key,
             bypass_serving_eligibility=bypass_serving_eligibility,
             index_eligible_read=index_eligible_read,
+            market_prices_read=market_prices_read,
         ) if resolved_content_key else None
         if ck_query is not None:
-            row = await database.fetch_one(ck_query, {"id": resolved_content_key})
+            row = await _fetch_view_row(ck_query, {"id": resolved_content_key})
     if not row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="PDP not found",
         )
 
-    return await _respond(_row_to_dict(row))
+    return await _respond(_row_to_dict(row), buyer_market)
