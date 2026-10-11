@@ -2,14 +2,17 @@
 
 Pinned here, because only the server can answer them:
 
-  * BEFORE the migration (the column absent), the flag-off write path -- UPSERT_SQL, unchanged --
-    still inserts and updates, and the route's flag-off SELECT still reads. Prod deploys skip
-    db/migrations/, so this is the state every environment is in until schema_guard runs.
-  * Migration 263 applies, and re-applies, cleanly.
-  * The flag-on upsert writes the summary as jsonb, the conflict branch overwrites it, '{}' is
-    stored as an empty object (not NULL), and the route's market_prices SELECT reads it back into
-    an SG buyer's SGD view.
-  * The backfill's keyset query for rows missing the summary plans and seeks.
+  * BEFORE the migration (the columns absent), the flag-off write -- UPSERT_SQL, unchanged --
+    still inserts and updates, and the flag-ON write (execute_agent_pdp_view_upsert) lands the
+    legacy row instead of failing. Prod deploys skip db/migrations/, so this is every
+    environment's state until schema_guard runs.
+  * Migration 263 applies, re-applies, and rolls back cleanly.
+  * The flag-on upsert stamps market_prices_refreshed_at with the row's own refreshed_at, and the
+    route's SELECT (market_prices_fresh_sql) serves the summary into an SG buyer's SGD view.
+  * STALENESS: a later write without the summary -- the flag-off upsert, and the repair script's
+    APV_OFFER_FIELDS_UPDATE_SQL -- retires the SGD offers and moves refreshed_at; the SELECT then
+    returns NULL and the SG buyer falls back to the legacy view, never the retired offer.
+  * The backfill's keyset scope finds the missing, stale and other-version rows, and only those.
 
 The statements are driven verbatim from the modules. PRIVATE DATABASE, created and dropped here,
 like test_agent_pdp_view_overlay_preservation_postgres.py: the real agent_pdp_view is a db.catalog
@@ -97,7 +100,7 @@ def _create_pre_migration_table(url: str) -> None:
         metadata.tables["agent_pdp_view"].create(engine)
     finally:
         engine.dispose()
-    _sync(url, "ALTER TABLE agent_pdp_view DROP COLUMN market_prices")
+    _sync(url, "ALTER TABLE agent_pdp_view DROP COLUMN market_prices, DROP COLUMN market_prices_refreshed_at")
 
 
 def _drive(url, coro_factory):
@@ -149,84 +152,119 @@ def _assembled(offers):
 def test_market_prices_lifecycle(db_url, monkeypatch) -> None:
     from routes import agent_pdp_v1
     from services import agent_pdp_view_assembler as assembler
+    import scripts.backfill_agent_pdp_view as backfill
+    from scripts.repair_external_seed_offer_mainline import APV_OFFER_FIELDS_UPDATE_SQL
 
-    monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", "US,SG")
+    monkeypatch.delenv("PIVOTA_SERVING_PRICING_REGIONS", raising=False)  # a writer with no regions
+    monkeypatch.setenv("AGENT_PDP_V1_MARKET_PRICES_READ", "on")
     monkeypatch.delenv(assembler.MARKET_PRICES_FLAG_ENV, raising=False)
+    assembler.reset_market_prices_probe()
     _create_pre_migration_table(db_url)
 
     legacy_row = _assembled(OFFERS)
-    assert assembler.upsert_sql_for_row(legacy_row) is assembler.UPSERT_SQL
     legacy_select = agent_pdp_v1.BYPASS_SELECT_BY_CONTENT_KEY_SQL
     market_select = agent_pdp_v1._MARKET_PRICES_SQL[legacy_select]
 
     async def before_migration(database):
-        # Flag off: insert, then the conflict branch, both on a table with no market_prices.
-        for _ in range(2):
+        for _ in range(2):  # insert, then the conflict branch
             await database.execute(assembler.UPSERT_SQL, assembler.row_to_upsert_params(legacy_row))
+        # Flag ON, columns absent: the legacy row lands; the refresh does not fail.
+        monkeypatch.setenv(assembler.MARKET_PRICES_FLAG_ENV, "on")
+        flagged = _assembled(OFFERS)
+        assert "market_prices" in flagged
+        assert await assembler.agent_pdp_view_has_market_prices(database) is False
+        await assembler.execute_agent_pdp_view_upsert(database, flagged)
         row = await database.fetch_one(legacy_select, {"id": CK})
         assert row is not None and row["currency"] == "USD"
-        # The flag-on SELECT is what must stay OFF until the column exists.
         with pytest.raises(Exception, match="market_prices"):
             await database.fetch_one(market_select, {"id": CK})
+        monkeypatch.delenv(assembler.MARKET_PRICES_FLAG_ENV, raising=False)
 
     _drive(db_url, before_migration)
 
     sql = _MIGRATION.read_text(encoding="utf-8")
     _sync(db_url, sql)
     _sync(db_url, sql)  # idempotent
+    assembler.reset_market_prices_probe()
 
-    monkeypatch.setenv(assembler.MARKET_PRICES_FLAG_ENV, "on")
-    row = _assembled(OFFERS)
-    empty = _assembled([])
+    async def sg_view(database):
+        stored = agent_pdp_v1._row_to_dict(await database.fetch_one(market_select, {"id": CK}))
+        return stored, agent_pdp_v1._market_view(stored, "SG")
+
+    async def keyset(database):
+        page_sql, params = backfill.build_content_key_query(
+            scope="market_prices_missing", limit=10, offset=7, after="")
+        return [r["content_key"] for r in await database.fetch_all(page_sql, params)]
 
     async def after_migration(database):
-        # Not computed yet: NULL, and the route keeps the legacy view for an SG buyer.
-        stored = agent_pdp_v1._row_to_dict(await database.fetch_one(market_select, {"id": CK}))
-        assert stored["market_prices"] is None
-        assert agent_pdp_v1._market_view(stored, "SG") is stored
+        assert await assembler.agent_pdp_view_has_market_prices(database) is True
+        # Not computed yet: NULL, legacy view, and the backfill finds it.
+        stored, view = await sg_view(database)
+        assert stored["market_prices"] is None and view is stored
+        assert await keyset(database) == [CK]
 
-        await database.execute(assembler.upsert_sql_for_row(row), assembler.row_to_upsert_params(row))
-        typed = await database.fetch_one(
-            "SELECT jsonb_typeof(market_prices) AS t, market_prices->'SG'->>'currency' AS sg_cur, "
-            "(market_prices->'SG'->>'price_min')::numeric AS sg_min, "
-            "jsonb_array_length(market_prices->'SG'->'offers') AS sg_offers, "
+        # Flag-on write: stamped with the row's own NOW(); the SG buyer gets the SGD view.
+        monkeypatch.setenv(assembler.MARKET_PRICES_FLAG_ENV, "on")
+        await assembler.execute_agent_pdp_view_upsert(database, _assembled(OFFERS))
+        typed = dict(await database.fetch_one(
+            "SELECT (market_prices_refreshed_at = refreshed_at) AS stamped, "
+            "market_prices->>'version' AS version, "
+            "(market_prices->'currencies'->'SGD'->>'price_min')::numeric AS sgd_min, "
+            "jsonb_array_length(market_prices->'currencies'->'SGD'->'offers') AS sgd_offers, "
             "currency, price_min, offer_count, jsonb_array_length(offers) AS n_offers "
-            "FROM agent_pdp_view WHERE content_key = :ck", {"ck": CK})
-        assert dict(typed) == {
-            "t": "object", "sg_cur": "SGD", "sg_min": Decimal("29.9"), "sg_offers": 2,
-            # Legacy columns: exactly what the flag-off write stored.
+            "FROM agent_pdp_view WHERE content_key = :ck", {"ck": CK}))
+        assert typed == {
+            "stamped": True, "version": "1", "sgd_min": Decimal("29.9"), "sgd_offers": 2,
             "currency": "USD", "price_min": Decimal("18.00"), "offer_count": 8, "n_offers": 5,
         }
+        _, view = await sg_view(database)
+        assert (view["currency"], view["price_min"], view["offer_count"]) == ("SGD", 29.9, 2)
+        assert {o["merchant_id"] for o in view["offers"]} == {"m_sg0", "m_sg1"}
+        assert await keyset(database) == []
 
-        stored = agent_pdp_v1._row_to_dict(await database.fetch_one(market_select, {"id": CK}))
-        view = agent_pdp_v1._market_view(stored, "SG")
-        assert view["currency"] == "SGD" and view["price_min"] == 29.9
-        assert [o["currency"] for o in view["offers"]] == ["SGD", "SGD"] + ["USD"] * 5
-        assert agent_pdp_v1._market_view(stored, "US") is stored
+        # STALE (P1-1), path 1: the SGD offers are retired and a writer WITHOUT the flag refreshes.
+        monkeypatch.delenv(assembler.MARKET_PRICES_FLAG_ENV, raising=False)
+        usd_only = [o for o in OFFERS if o["currency"] == "USD"]
+        await assembler.execute_agent_pdp_view_upsert(database, _assembled(usd_only))
+        stored, view = await sg_view(database)
+        assert stored["market_prices"] is None and view is stored
+        assert all(o["currency"] == "USD" for o in view["offers"])
+        assert await keyset(database) == [CK]
 
-        # A recompute that finds nothing priced writes {} (computed), never NULL.
-        empty_params = assembler.row_to_upsert_params({**empty, "title": "Barrier Cream"})
-        await database.execute(assembler.upsert_sql_for_row(empty), empty_params)
-        assert await database.fetch_val(
-            "SELECT market_prices::text FROM agent_pdp_view WHERE content_key = :ck", {"ck": CK}
-        ) == "{}"
+        # Re-stamp, then STALE path 2: the repair script's offer-field update.
+        monkeypatch.setenv(assembler.MARKET_PRICES_FLAG_ENV, "on")
+        await assembler.execute_agent_pdp_view_upsert(database, _assembled(OFFERS))
+        assert (await sg_view(database))[1]["currency"] == "SGD"
+        await database.execute(APV_OFFER_FIELDS_UPDATE_SQL, {
+            "content_key": CK, "currency": "USD", "price_min": Decimal("18.00"),
+            "price_max": Decimal("23.00"), "offer_count": 6, "offers": "[]",
+            "refresh_source": "repair_test",
+        })
+        stored, view = await sg_view(database)
+        assert stored["market_prices"] is None and view is stored
 
-        # The backfill's keyset page: plans, seeks past :after, and skips computed rows.
-        import scripts.backfill_agent_pdp_view as backfill
-
+        # Another version is not served, and the backfill re-selects it.
+        await assembler.execute_agent_pdp_view_upsert(database, _assembled(OFFERS))
         await database.execute(
-            "UPDATE agent_pdp_view SET market_prices = NULL WHERE content_key = :ck", {"ck": CK})
-        page_sql, params = backfill.build_content_key_query(
-            scope="market_prices_missing", limit=10, offset=0, after="")
-        assert [r["content_key"] for r in await database.fetch_all(page_sql, params)] == [CK]
+            "UPDATE agent_pdp_view SET market_prices = jsonb_set(market_prices, '{version}', '2') "
+            "WHERE content_key = :ck", {"ck": CK})
+        assert (await sg_view(database))[0]["market_prices"] is None
+        assert await keyset(database) == [CK]
         page_sql, params = backfill.build_content_key_query(
             scope="market_prices_missing", limit=10, offset=0, after=CK)
         assert await database.fetch_all(page_sql, params) == []
 
+        # A recompute that finds nothing priced: a version-1 object with no currencies, never NULL.
+        await assembler.execute_agent_pdp_view_upsert(database, _assembled([]))
+        assert await database.fetch_val(
+            "SELECT market_prices->'currencies' = '{}'::jsonb FROM agent_pdp_view WHERE content_key = :ck",
+            {"ck": CK}) is True
+
     _drive(db_url, after_migration)
+    assembler.reset_market_prices_probe()
 
 
-def test_down_migration_drops_the_column(db_url) -> None:
+def test_down_migration_drops_the_columns(db_url) -> None:
     _create_pre_migration_table(db_url)
     _sync(db_url, _MIGRATION.read_text(encoding="utf-8"))
     down = REPO_ROOT / "db" / "migrations" / "down" / "263_agent_pdp_view_market_prices_down.sql"
@@ -235,6 +273,6 @@ def test_down_migration_drops_the_column(db_url) -> None:
     async def check(database):
         return await database.fetch_val(
             "SELECT count(*) FROM information_schema.columns "
-            "WHERE table_name = 'agent_pdp_view' AND column_name = 'market_prices'")
+            "WHERE table_name = 'agent_pdp_view' AND column_name LIKE 'market_prices%'")
 
     assert _drive(db_url, check) == 0

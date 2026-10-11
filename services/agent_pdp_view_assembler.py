@@ -1017,41 +1017,53 @@ def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
 
 
 # ---------------------------------------------------------------------
-# Per-market price summary (agent_pdp_view.market_prices, migration 263)
+# Per-currency price summary (agent_pdp_view.market_prices, migration 263)
 # ---------------------------------------------------------------------
 #
 # WHY. The row-level currency / price_min / price_max above are ONE currency:
-# the modal one, ties to the higher code. A product carrying USD offers and
-# their SGD siblings (retailer_ingest shopify_markets, market 'SG') is therefore
-# a USD row, and every reader that serves an SG buyer from those columns drops
-# it; and the top-N cut sorts raw prices across currencies, so the SGD offers
-# can be cut from `offers` altogether.
+# the modal one, ties to the higher code. A product can carry offers in several
+# served currencies (retailer_ingest shopify_markets writes USD siblings beside a
+# non-USD base offer today, and SGD siblings beside USD ones once #2553 lands);
+# with USD offers and SGD ones it is a USD row, and every reader that serves an
+# SG buyer from those columns drops it; and the top-N cut sorts raw prices
+# across currencies, so the SGD offers can be cut from `offers` altogether.
 #
-# THE CONTRACT. A jsonb map keyed by SERVED pricing region
-# (PIVOTA_SERVING_PRICING_REGIONS, e.g. US,SG):
+# THE CONTRACT (version 1):
 #
-#   {"US": {"currency": "USD", "price_min": 18.0, "price_max": 24.0,
-#           "offer_count": 3, "offers": [<top-N USD offers>]},
-#    "SG": {"currency": "SGD", ...}}
+#   {"version": 1,
+#    "currencies": {"USD": {"price_min": 18.0, "price_max": 24.0,
+#                           "offer_count": 3, "offers": [<top-N USD offers>]},
+#                   "SGD": {...}}}
 #
-#   * A region's entry covers exactly the offers priced in that region's
-#     currency (services/region_pricing) -- currency, never offers.market, which
-#     is a DEFAULT 'US' most writers never set (region_pricing's docstring).
-#     No conversion: an entry only ever compares amounts in its own currency.
+#   * One entry per currency the offers are priced in (upper-cased ISO code;
+#     an offer with no well-formed code prices no entry). KEYED BY CURRENCY, and
+#     every currency, so the stored value never depends on the writer's
+#     environment (PIVOTA_SERVING_PRICING_REGIONS): the READER maps its buyer's
+#     market to a currency (services/region_pricing) and decides what it serves.
+#     Never offers.market, a DEFAULT 'US' most writers never set.
+#   * No conversion: an entry only compares amounts in its own currency.
 #   * offer_count counts every such offer, unavailable ones included, like the
 #     row-level offer_count; `offers` is that currency's top OFFER_TOP_N in the
 #     stored order (_offer_sort_key), the same offer dicts `offers` carries.
-#   * A region with no offer in its currency has NO key. {} = computed, nothing
-#     priced for any served region. NULL (the column default) = not computed
-#     yet: every reader must fall back to the legacy columns.
+#   * {"version": 1, "currencies": {}} = computed, no priced offer.
 #
-# The legacy columns (currency, price_min, price_max, offer_count, offers) are
-# computed exactly as before and never read from here, so every existing reader
-# sees byte-identical values. Written only while AGENT_PDP_VIEW_MARKET_PRICES is
-# on: with it off, assemble_row emits no `market_prices` key and the upsert does
-# not name the column, so a database without migration 263 keeps working.
+# STALENESS. A writer without the flag (an old image, a one-off with no env,
+# the flag turned off, scripts/repair_external_seed_offer_mainline.py's
+# APV_OFFER_FIELDS_UPDATE_SQL) rewrites offers and refreshed_at but not the
+# summary. So the flag-on upsert stamps market_prices_refreshed_at with the
+# same NOW() as refreshed_at, and readers use the summary ONLY while the two
+# are equal (MARKET_PRICES_FRESH_SQL); any later write that bumps refreshed_at
+# without restamping retires it. NULL summary, NULL stamp, an unknown version:
+# all read as "not computed", and readers fall back to the legacy columns.
+#
+# The legacy columns are computed exactly as before and never read from here.
+# Written only while AGENT_PDP_VIEW_MARKET_PRICES is on and the columns exist
+# (agent_pdp_view_has_market_prices): otherwise assemble_row emits no summary
+# and the upsert is UPSERT_SQL byte for byte.
 
 MARKET_PRICES_FLAG_ENV = "AGENT_PDP_VIEW_MARKET_PRICES"
+MARKET_PRICES_VERSION = 1
+_ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 
 def market_prices_enabled() -> bool:
@@ -1061,12 +1073,15 @@ def market_prices_enabled() -> bool:
     }
 
 
-def _served_pricing_regions() -> List[str]:
-    # Lazy: index_pipeline_state_service is the owner of the served-region list
-    # (PIVOTA_SERVING_PRICING_REGIONS) and a heavy import.
-    from services.index_pipeline_state_service import serving_pricing_regions
-
-    return serving_pricing_regions()
+def market_prices_fresh_sql(alias: str = "") -> str:
+    """The summary only while it was written by the write that set refreshed_at, else NULL.
+    Every reader selects the column through this, never bare."""
+    a = f"{alias}." if alias else ""
+    return (
+        f"CASE WHEN {a}market_prices_refreshed_at = {a}refreshed_at "
+        f"AND {a}market_prices->>'version' = '{MARKET_PRICES_VERSION}' "
+        f"THEN {a}market_prices END"
+    )
 
 
 def build_market_prices(
@@ -1074,37 +1089,98 @@ def build_market_prices(
     primary_merchant_id: Optional[str],
     merchant_url_by_id: Dict[str, Optional[str]],
     seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
-    *,
-    regions: Optional[List[str]] = None,
-) -> Dict[str, Dict[str, Any]]:
-    """The per-served-region price summary (contract above). Pure."""
-    from services.region_pricing import pricing_currency_for_region_or_none
-
+) -> Dict[str, Any]:
+    """The per-currency price summary (contract above). Pure, and independent of
+    process environment."""
     normalized = sorted(
         _normalized_offers(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id),
         key=_offer_sort_key,
     )
-    summary: Dict[str, Dict[str, Any]] = {}
-    for region in (regions if regions is not None else _served_pricing_regions()):
-        code = str(region or "").strip().upper()
-        currency = pricing_currency_for_region_or_none(code)
-        if not currency or code in summary:
-            continue
-        in_currency = [
-            n for n in normalized
-            if str(n.get("currency") or "").strip().upper() == currency
-        ]
-        if not in_currency:
-            continue
+    by_currency: Dict[str, List[Dict[str, Any]]] = {}
+    for n in normalized:
+        code = str(n.get("currency") or "").strip().upper()
+        if _ISO_CURRENCY_RE.match(code):
+            by_currency.setdefault(code, []).append(n)
+    currencies: Dict[str, Dict[str, Any]] = {}
+    for code in sorted(by_currency):
+        in_currency = by_currency[code]
         prices = [Decimal(str(n["price"])) for n in in_currency]
-        summary[code] = {
-            "currency": currency,
+        currencies[code] = {
             "price_min": float(min(prices)),
             "price_max": float(max(prices)),
             "offer_count": len(in_currency),
             "offers": in_currency[:OFFER_TOP_N],
         }
-    return summary
+    return {"version": MARKET_PRICES_VERSION, "currencies": currencies}
+
+
+def market_prices_entry(market_prices: Any, currency: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A reader's lookup: the entry for `currency` in a version-1 summary, else None."""
+    if isinstance(market_prices, str):
+        try:
+            market_prices = json.loads(market_prices)
+        except ValueError:
+            return None
+    if not isinstance(market_prices, dict) or market_prices.get("version") != MARKET_PRICES_VERSION:
+        return None
+    currencies = market_prices.get("currencies")
+    code = str(currency or "").strip().upper()
+    entry = currencies.get(code) if isinstance(currencies, dict) and code else None
+    return entry if isinstance(entry, dict) else None
+
+
+# Does agent_pdp_view have both columns? Migration 263 does not self-apply (schema_guard adds the
+# columns at boot, and a heal can defer), and a writer or reader naming a missing column fails --
+# for the refresh path silently, since catalog_sync swallows the error and legacy prices would stop
+# refreshing. Probed once per process: a positive answer is kept, a negative one for
+# _MARKET_PRICES_PROBE_RETRY_S, so a later heal is picked up without a restart.
+_MARKET_PRICES_COLUMNS = ("market_prices", "market_prices_refreshed_at")
+_MARKET_PRICES_PROBE_RETRY_S = 300.0
+_market_prices_probe: Dict[str, Any] = {"present": None, "checked_at": 0.0}
+MARKET_PRICES_COLUMNS_PROBE_SQL = """
+    SELECT count(*) AS n
+    FROM information_schema.columns
+    WHERE table_name = 'agent_pdp_view'
+      AND table_schema = ANY(current_schemas(false))
+      AND column_name IN ('market_prices', 'market_prices_refreshed_at')
+"""
+
+
+def reset_market_prices_probe() -> None:
+    _market_prices_probe.update(present=None, checked_at=0.0)
+
+
+def mark_market_prices_columns_missing() -> None:
+    import time
+
+    _market_prices_probe.update(present=False, checked_at=time.monotonic())
+
+
+async def agent_pdp_view_has_market_prices(db: Any = None) -> bool:
+    import time
+
+    if _market_prices_probe["present"] is True:
+        return True
+    now = time.monotonic()
+    if (
+        _market_prices_probe["present"] is False
+        and now - _market_prices_probe["checked_at"] < _MARKET_PRICES_PROBE_RETRY_S
+    ):
+        return False
+    try:
+        row = await (db or database).fetch_one(MARKET_PRICES_COLUMNS_PROBE_SQL)
+        present = bool(row) and int(dict(row).get("n") or 0) == len(_MARKET_PRICES_COLUMNS)
+    except Exception:  # noqa: BLE001 - an unanswerable probe is "absent": the legacy path is safe
+        present = False
+    _market_prices_probe.update(present=present, checked_at=now)
+    return present
+
+
+def is_missing_market_prices_column_error(exc: BaseException) -> bool:
+    """asyncpg UndefinedColumnError (42703) naming the summary columns."""
+    code = getattr(exc, "sqlstate", None) or getattr(getattr(exc, "orig", None), "sqlstate", None)
+    message = str(exc)
+    return (code == "42703" or "does not exist" in message) and "market_prices" in message
 
 
 def aggregate_variants(skus: List[Dict[str, Any]], canonical_source_product_id: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
@@ -1710,8 +1786,9 @@ UPSERT_SQL = """
 
 
 def _upsert_sql_with_market_prices(base: str) -> str:
-    """UPSERT_SQL plus the market_prices column (migration 263), derived from it
-    so the two can never drift in any other column."""
+    """UPSERT_SQL plus market_prices and its stamp (migration 263), derived from it
+    so the two can never drift in any other column. The stamp is the statement's
+    own NOW(), the value refreshed_at gets in the same row write."""
     insert_anchor = "      rating_value, rating_count,\n      refreshed_at,"
     values_anchor = "      :rating_value, :rating_count,\n      NOW(),"
     update_anchor = "      rating_count = EXCLUDED.rating_count,\n"
@@ -1719,9 +1796,20 @@ def _upsert_sql_with_market_prices(base: str) -> str:
         if base.count(anchor) != 1:
             raise RuntimeError("UPSERT_SQL changed shape; update _upsert_sql_with_market_prices")
     return (
-        base.replace(insert_anchor, "      rating_value, rating_count, market_prices,\n      refreshed_at,")
-        .replace(values_anchor, "      :rating_value, :rating_count, CAST(:market_prices AS jsonb),\n      NOW(),")
-        .replace(update_anchor, update_anchor + "      market_prices = EXCLUDED.market_prices,\n")
+        base.replace(
+            insert_anchor,
+            "      rating_value, rating_count, market_prices, market_prices_refreshed_at,\n      refreshed_at,",
+        )
+        .replace(
+            values_anchor,
+            "      :rating_value, :rating_count, CAST(:market_prices AS jsonb), NOW(),\n      NOW(),",
+        )
+        .replace(
+            update_anchor,
+            update_anchor
+            + "      market_prices = EXCLUDED.market_prices,\n"
+            + "      market_prices_refreshed_at = EXCLUDED.market_prices_refreshed_at,\n",
+        )
     )
 
 
@@ -1733,6 +1821,24 @@ def upsert_sql_for_row(row: Dict[str, Any]) -> str:
     row carries the key (AGENT_PDP_VIEW_MARKET_PRICES on), else UPSERT_SQL byte
     for byte -- which never names the column, so it runs before migration 263."""
     return UPSERT_SQL_WITH_MARKET_PRICES if "market_prices" in row else UPSERT_SQL
+
+
+async def execute_agent_pdp_view_upsert(db: Any, row: Dict[str, Any]) -> None:
+    """Write an assembled row. The summary is written only when the columns exist;
+    otherwise -- the heal not run yet -- the row is written exactly as with the
+    flag off, so the legacy prices keep refreshing instead of every refresh
+    failing on the missing column."""
+    if "market_prices" in row and not await agent_pdp_view_has_market_prices(db):
+        row = {k: v for k, v in row.items() if k != "market_prices"}
+    try:
+        await db.execute(upsert_sql_for_row(row), row_to_upsert_params(row))
+    except Exception as exc:
+        if "market_prices" not in row or not is_missing_market_prices_column_error(exc):
+            raise
+        # The probe said present and the write says otherwise (dropped after the probe).
+        mark_market_prices_columns_missing()
+        legacy = {k: v for k, v in row.items() if k != "market_prices"}
+        await db.execute(UPSERT_SQL, row_to_upsert_params(legacy))
 
 
 def to_jsonb(value: Any) -> Optional[str]:
@@ -1760,10 +1866,11 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     # fashion fields are plain text + float and pass through unchanged.
     params["size_guide"] = to_jsonb(row.get("size_guide"))
     if "market_prices" in row:
-        # {} (computed, nothing priced for a served region) is written as '{}',
-        # never NULL: NULL means "not computed yet" to every reader.
+        # Always a version-1 object, never NULL: NULL means "not computed yet".
         mp = row.get("market_prices")
-        params["market_prices"] = to_jsonb(mp if mp is not None else {})
+        params["market_prices"] = to_jsonb(
+            mp if mp is not None else {"version": MARKET_PRICES_VERSION, "currencies": {}}
+        )
     params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
     # Default FALSE, so every existing caller that builds a row without going
     # through build_agent_pdp_view_row keeps the previous overwrite semantics
@@ -2007,7 +2114,7 @@ async def refresh_agent_pdp_view_for_content_key(
     )
     if row is None:
         return False
-    await read_db.execute(upsert_sql_for_row(row), row_to_upsert_params(row))
+    await execute_agent_pdp_view_upsert(read_db, row)
     return True
 
 
