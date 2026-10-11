@@ -1,4 +1,4 @@
-"""The rail-neutral purchase ledger (migration 263): one `agent_purchases` row per purchase on ANY
+"""The rail-neutral purchase ledger (migration 264): one `agent_purchases` row per purchase on ANY
 payment rail, pointing at that rail's own purchase row.
 
 Payment orchestration P0. Today the
@@ -63,7 +63,7 @@ def is_enabled() -> bool:
 
 # ── schema ───────────────────────────────────────────────────────────────────────────────────
 #
-# db/migrations/263_agent_purchases.sql is the same DDL. Which of the two builds the table in a given
+# db/migrations/264_agent_purchases.sql is the same DDL. Which of the two builds the table in a given
 # environment depends on its startup mode (a fast-mode boot skips db/migrations/; the boot runner
 # applies unledgered files otherwise), so BOTH must be safe and identical:
 # db/schema_guard.ensure_required_schema_light calls `ensure_agent_purchase_schema` on both dialects,
@@ -104,7 +104,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_purchases_owner
 
 
 async def ensure_agent_purchase_schema() -> None:
-    """Self-heal parity with migration 263. Idempotent; called at every startup."""
+    """Self-heal parity with migration 264. Idempotent; called at every startup."""
     # `if`/`else` statements, not a conditional expression: the PREPARE gate resolves only a literal or a
     # module-level name as the first argument, and an IfExp hides BOTH statements from it.
     if IS_POSTGRES:

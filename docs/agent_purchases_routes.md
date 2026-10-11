@@ -1,7 +1,7 @@
 # `/agent/v2/commerce/purchases`: the rail-neutral purchase read
 
 `routes/agent_commerce_purchases.py` implements this contract. The storage is
-`db/agent_purchase_ledger.py` (migration 263); the shared state vocabulary is
+`db/agent_purchase_ledger.py` (migration 264); the shared state vocabulary is
 `services/payment_orchestration/rails.py`.
 
 **Payment orchestration P0.** One purchase id (`pp_…`) and one state vocabulary across payment

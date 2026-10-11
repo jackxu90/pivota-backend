@@ -1,6 +1,6 @@
 """db/agent_purchase_ledger.py on Postgres: the production dialect.
 
-What only Postgres can show: that the self-heal builds the SAME schema as migration 263 (columns,
+What only Postgres can show: that the self-heal builds the SAME schema as migration 264 (columns,
 pg_indexes.indexdef, CHECK definitions), that concurrent writers on separate connections leave
 exactly one parent, and that jsonb and timestamptz come back as Python values through asyncpg.
 
@@ -21,10 +21,10 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 
 pytestmark = pytest.mark.skipif(
     not _IS_PG,
-    reason="needs a Postgres DATABASE_URL; this is the production-dialect gate for migration 263",
+    reason="needs a Postgres DATABASE_URL; this is the production-dialect gate for migration 264",
 )
 
-_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/263_agent_purchases.sql"
+_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/264_agent_purchases.sql"
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
 AGENT = "agent_pg"
@@ -106,7 +106,7 @@ async def _reap(agent_id: str = AGENT, owner: str = OWNER) -> str:
     return purchase["id"]
 
 
-async def test_the_self_heal_builds_the_same_schema_as_migration_263():
+async def test_the_self_heal_builds_the_same_schema_as_migration_264():
     from db.database import database
     from db.sql_migrations import split_statements
     import db.agent_purchase_ledger as purchases

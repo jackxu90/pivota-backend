@@ -1,6 +1,6 @@
 """db/agent_purchase_ledger.py + services/payment_orchestration/rails.py, on SQLite.
 
-The Postgres arm (schema parity with migration 263, concurrent writers, jsonb on asyncpg) is
+The Postgres arm (schema parity with migration 264, concurrent writers, jsonb on asyncpg) is
 tests/test_agent_purchase_ledger_postgres.py. Tables are built the way production builds them:
 through the schema-guard self-heal.
 """
@@ -78,14 +78,14 @@ def test_the_check_vocabularies_are_the_python_tuples(source):
     ddl = (
         purchases._CREATE_TABLE_PG
         if source == "module"
-        else (_REPO / "db/migrations/263_agent_purchases.sql").read_text("utf-8")
+        else (_REPO / "db/migrations/264_agent_purchases.sql").read_text("utf-8")
     )
     assert _check_values(ddl, "rail") == purchases.RAILS
     assert _check_values(ddl, "executor") == purchases.EXECUTORS
 
 
 def test_the_migration_creates_the_table_and_indexes_the_module_creates():
-    migration = (_REPO / "db/migrations/263_agent_purchases.sql").read_text("utf-8")
+    migration = (_REPO / "db/migrations/264_agent_purchases.sql").read_text("utf-8")
     squash = lambda text: " ".join(text.split())  # noqa: E731
     for statement in (purchases._CREATE_TABLE_PG, purchases._CREATE_RAIL_INDEX, purchases._CREATE_OWNER_INDEX):
         assert squash(statement) in squash(migration)

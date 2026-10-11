@@ -1,4 +1,4 @@
--- 263: THE RAIL-NEUTRAL PURCHASE LEDGER (payment orchestration P0).
+-- 264: THE RAIL-NEUTRAL PURCHASE LEDGER (payment orchestration P0).
 --
 -- One row per purchase on ANY payment rail, pointing at that rail's own purchase row. Today the
 -- only rail is Reap (reap_agentic_purchases, executor rail_managed: the rail places the order);

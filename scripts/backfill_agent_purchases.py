@@ -1,4 +1,4 @@
-"""Backfill the rail-neutral purchase ledger (migration 263) from the Reap purchase table.
+"""Backfill the rail-neutral purchase ledger (migration 264) from the Reap purchase table.
 
 Writes one `agent_purchases` parent for every Reap purchase that has none, oldest first, in
 batches, until none are missing. Idempotent: a second run writes nothing, and it is safe beside

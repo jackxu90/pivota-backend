@@ -1179,7 +1179,7 @@ async def ensure_required_schema_light() -> None:
                 await ensure_price_witness_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
-            # mig 263: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
             # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
             # transaction, and a failure here must not starve what follows. The DDL lives in
             # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
@@ -1187,7 +1187,7 @@ async def ensure_required_schema_light() -> None:
                 from db.agent_purchase_ledger import ensure_agent_purchase_schema
                 await ensure_agent_purchase_schema()
             except Exception as exc:
-                logger.warning("schema_guard: agent_purchases (mig 263) unavailable (%s)", type(exc).__name__)
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
             # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
             # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
             # same index. Two purchases of one buyer, each in 'resolving' in one
@@ -3921,7 +3921,7 @@ async def ensure_required_schema_light() -> None:
                 await ensure_price_witness_schema()
             except Exception as exc:
                 logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
-            # mig 263: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
             # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
             # transaction, and a failure here must not starve what follows. The DDL lives in
             # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
@@ -3929,7 +3929,7 @@ async def ensure_required_schema_light() -> None:
                 from db.agent_purchase_ledger import ensure_agent_purchase_schema
                 await ensure_agent_purchase_schema()
             except Exception as exc:
-                logger.warning("schema_guard: agent_purchases (mig 263) unavailable (%s)", type(exc).__name__)
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
             # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
             # the Postgres block above (same index, same reason, same own try:
             # it fails on a database that already holds two pending rows for one
