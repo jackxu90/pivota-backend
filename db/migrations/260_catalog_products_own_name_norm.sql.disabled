@@ -1,12 +1,16 @@
--- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). main.startup() runs
--- db.sql_migrations.run_sql_migrations at EVERY boot over every active db/migrations/*.sql file not yet
--- in the ledger, with NO lock_timeout. As an active file this would have been applied by the next
--- deploy: an ALTER TABLE ... ADD COLUMN + CREATE TRIGGER on catalog_products takes an ACCESS EXCLUSIVE
--- lock, and queued behind the gateway's 5-11 s category reads it would have piled every reader and
--- writer of the hottest table behind the boot (pivota-backend #2549 deploy 38046794859, cancelled).
--- Apply it from a one-off job that reads THIS file through db.sql_migrations.split_statements and runs
--- the statements in ONE transaction with `SET LOCAL lock_timeout = '3s'` (retry the whole file on a
--- lock timeout), with the primary under 35% CPU. The runbook is in #2549 / #2404.
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). Prod deploys do NOT run startup
+-- migrations: main.startup() returns early in fast mode (SKIP_HEAVY_STARTUP_INIT='true', which
+-- infra/gcp/deploy_backend.sh and deploy_worker.sh set on EVERY Cloud Run deploy, prod and staging;
+-- default is_production()) before it reaches db.sql_migrations.run_sql_migrations, so no deploy applies
+-- this file. It is applied by hand, from a one-off job, in order: 260 first,
+-- then 261 after the backfill. The job reads THIS file through db.sql_migrations.split_statements and
+-- runs the statements in ONE transaction with `SET LOCAL lock_timeout = '3s'` (retry the whole file on
+-- a lock timeout), with the primary under 35% CPU: an ALTER TABLE ... ADD COLUMN + CREATE TRIGGER on
+-- catalog_products takes an ACCESS EXCLUSIVE lock, and queued behind the gateway's 5-11 s category
+-- reads it would pile every reader and writer of the hottest table behind it. The runbook is in
+-- #2549 / #2404. The .disabled suffix also keeps the file out of the boot runner in any environment
+-- that DOES run the full startup (local, CI, SKIP_HEAVY_STARTUP_INIT=false), which applies every
+-- active db/migrations/*.sql file not yet in the ledger, with no lock_timeout.
 --
 -- 260: the row's OWN NAME, folded once at write time, for the gateway's category browse (PIVOTA-Agent #2404).
 --

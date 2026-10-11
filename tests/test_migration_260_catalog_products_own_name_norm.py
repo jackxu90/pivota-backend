@@ -15,8 +15,10 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-# *.sql.disabled: the boot runner (main.startup -> run_sql_migrations) applies every ACTIVE *.sql file
-# it has not ledgered, with no lock_timeout; these two are applied by hand, in order, from a one-off job.
+# *.sql.disabled: deploys skip startup migrations (main.startup returns early in fast mode,
+# SKIP_HEAVY_STARTUP_INIT=true on every Cloud Run deploy), so these two are applied by hand, in order,
+# from a one-off job; the suffix also keeps them out of the boot runner in any environment that runs
+# the full startup, which applies every ACTIVE *.sql file it has not ledgered, with no lock_timeout.
 UP_260 = REPO / "db" / "migrations" / "260_catalog_products_own_name_norm.sql.disabled"
 UP_261 = REPO / "db" / "migrations" / "261_catalog_products_name_norm_trgm_index.sql.disabled"
 DOWN_260 = REPO / "db" / "migrations" / "down" / "260_catalog_products_own_name_norm_down.sql"
@@ -55,7 +57,7 @@ def test_both_files_are_invisible_to_the_boot_runner_and_say_why() -> None:
     assert not (set(Path(f).name for f in list_hand_applied_migration_files(str(REPO))) & active)
     assert UP_260.exists() and UP_261.exists()
     for name in ("260_catalog_products_own_name_norm.sql", "261_catalog_products_name_norm_trgm_index.sql"):
-        assert name not in active, f"{name} would be applied on the next boot"
+        assert name not in active, f"{name} would be applied by any environment that runs the full startup"
         assert not (REPO / "db" / "migrations" / name).exists()
     assert not any(n.startswith(("260_", "261_")) for n in active)
     # The hand-apply still runs them the way the runner would classify them: 260 in one transaction,
