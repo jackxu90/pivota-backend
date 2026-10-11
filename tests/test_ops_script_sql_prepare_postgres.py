@@ -560,6 +560,12 @@ def _collect_backfill_agent_pdp_view() -> List[Tuple[str, str]]:
          module.build_content_key_query(scope=scope, limit=limit, offset=offset)[0])
         for scope, limit, offset in shapes
     ]
+    # The market_prices (migration 263) keyset page: its own statement, with the :after seek.
+    statements += [
+        (f"{origin}.build_content_key_query(scope=market_prices_missing, limit={limit}, offset=0)",
+         module.build_content_key_query(scope="market_prices_missing", limit=limit, offset=0, after="ck_")[0])
+        for limit in (0, 10)
+    ]
     # The downgrade guard's read. It runs once per candidate on every pass,
     # including dry runs, so an unplannable version would abort the whole job.
     statements.append((f"{origin}._CURRENT_OVERLAY_SQL", module._CURRENT_OVERLAY_SQL))
