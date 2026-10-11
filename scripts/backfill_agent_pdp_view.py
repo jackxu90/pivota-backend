@@ -42,6 +42,18 @@ Apply it:
 Dry-run / apply over the whole corpus, paginated:
   python3 scripts/backfill_agent_pdp_view.py --limit 200 --offset 0
   python3 scripts/backfill_agent_pdp_view.py --apply --limit 200 --offset 0
+
+Fill agent_pdp_view.market_prices (migration 263) on the rows whose summary is
+missing, stale (a later write without the flag moved refreshed_at past its
+stamp) or of another version. Requires AGENT_PDP_VIEW_MARKET_PRICES=on in the
+job's env (the script refuses otherwise: it would rewrite rows without the
+summary). The summary is keyed by currency, so it does not depend on the job's
+PIVOTA_SERVING_PRICING_REGIONS. Keyset-paged on content_key (--offset is not
+used: the --apply set shrinks as it fills); pass the report's `next_after` back
+as --after until `content_keys_considered` is 0. --sleep throttles the writes
+for the 2-vCPU primary; a row that fails is counted and the page continues:
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py \
+      --scope market_prices_missing --limit 500 --sleep 0.05 --apply [--after <content_key>]
 """
 
 from __future__ import annotations
@@ -59,9 +71,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     BACKFILL_REFRESH_SOURCE,
-    UPSERT_SQL,
+    MARKET_PRICES_VERSION,
     build_agent_pdp_view_row,
-    row_to_upsert_params,
+    execute_agent_pdp_view_upsert,
+    market_prices_enabled,
 )
 
 logger = logging.getLogger("backfill_agent_pdp_view")
@@ -94,30 +107,52 @@ _ENRICHED_KEYS_SQL = """
     ORDER BY cp.content_key ASC
 """
 
+# Rows whose summary readers would not use: never computed, stale (its stamp is
+# not the row's refreshed_at), or another version. The negation of
+# market_prices_fresh_sql's test, so this finds exactly what readers ignore.
+# Keyset on content_key: the PK index serves the order and the `> :after` seek.
+_MARKET_PRICES_MISSING_KEYS_SQL = f"""
+    SELECT content_key
+    FROM agent_pdp_view
+    WHERE (market_prices IS NULL
+           OR market_prices_refreshed_at IS DISTINCT FROM refreshed_at
+           OR market_prices->>'version' IS DISTINCT FROM '{MARKET_PRICES_VERSION}')
+      AND content_key > :after
+    ORDER BY content_key ASC
+"""
+
 
 def build_content_key_query(
-    *, scope: str, limit: int, offset: int
+    *, scope: str, limit: int, offset: int, after: str = ""
 ) -> Tuple[str, Dict[str, Any]]:
     """(sql, params) for the content_key window. A pure builder so the driven
     PREPARE gate can plan every shape it emits against real Postgres — the
     assembled string lives in a function local, which the static sweep in
     tests/test_repo_sql_prepare_postgres.py cannot follow."""
-    sql = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
     params: Dict[str, Any] = {}
+    keyset = scope == "market_prices_missing"
+    if keyset:
+        sql = _MARKET_PRICES_MISSING_KEYS_SQL
+        params["after"] = str(after or "")
+    else:
+        sql = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
     if limit > 0:
         sql += "\n        LIMIT :limit"
         params["limit"] = int(limit)
-    if offset > 0:
+    # Keyset pages never take an OFFSET: it would skip rows the shrinking set moved up.
+    if offset > 0 and not keyset:
         sql += "\n        OFFSET :offset"
         params["offset"] = int(offset)
     return sql, params
 
 
-async def _fetch_content_keys(*, scope: str, limit: int, offset: int) -> List[str]:
+async def _fetch_content_keys(
+    *, scope: str, limit: int, offset: int, after: str = ""
+) -> List[str]:
     """Stable content_key window. Paged by content_key ASC so each chunk is a
     disjoint slice — no double-writes, safe to resume on partial failures.
     """
-    sql, params = build_content_key_query(scope=scope, limit=limit, offset=offset)
+    sql, params = build_content_key_query(scope=scope, limit=limit, offset=offset, after=after)
     rows = await database.fetch_all(sql, params)
     return [r["content_key"] for r in rows or []]
 
@@ -175,6 +210,12 @@ def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
 # ---------------------------------------------------------------------
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
+    if args.scope == "market_prices_missing" and not market_prices_enabled():
+        # Without the flag the assembled row carries no market_prices, the
+        # upsert leaves the column NULL, and the next pass selects the same keys.
+        raise SystemExit(
+            "--scope market_prices_missing needs AGENT_PDP_VIEW_MARKET_PRICES=on"
+        )
     if not getattr(database, "is_connected", False):
         await database.connect()
 
@@ -182,7 +223,8 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         ENRICHED_REFRESH_SOURCE if args.scope == "enriched" else BACKFILL_REFRESH_SOURCE
     )
     content_keys = await _fetch_content_keys(
-        scope=args.scope, limit=args.limit, offset=args.offset
+        scope=args.scope, limit=args.limit, offset=args.offset,
+        after=getattr(args, "after", "") or "",
     )
     logger.info(
         "loaded %d content_keys (scope=%s limit=%d offset=%d)",
@@ -191,6 +233,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
 
     outcomes: Dict[str, int] = {
         "content_keys_considered": len(content_keys),
+        "rows_failed": 0,
         "rows_assembled": 0,
         "rows_skipped_nothing_to_build": 0,
         "rows_upserted": 0,
@@ -203,48 +246,24 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
     }
     samples: List[Dict[str, Any]] = []
     downgrades: List[str] = []
+    failures: List[Dict[str, str]] = []
+    sleep_s = max(0.0, float(getattr(args, "sleep", 0.0) or 0.0))
 
     for ck in content_keys:
-        # Assemble through the canonical read path so the evidence, enrichment
-        # and seller-trust overlays are attached. Dry-run stops here; apply
-        # persists exactly this row.
-        row = await build_agent_pdp_view_row(ck, refresh_source=refresh_source)
-        if row is None:
-            outcomes["rows_skipped_nothing_to_build"] += 1
-            continue
-        outcomes["rows_assembled"] += 1
-
-        current = await database.fetch_one(_CURRENT_OVERLAY_SQL, {"ck": ck})
-        if _would_downgrade(row, dict(current) if current else None):
-            # Reported in BOTH modes, and skipped in both: a dry run that does
-            # not surface this would send an operator into --apply believing the
-            # run can only add.
-            outcomes["rows_skipped_would_downgrade"] += 1
-            if len(downgrades) < 20:
-                downgrades.append(ck)
-            continue
-
-        flags = _overlay_flags(row)
-        for name, present in flags.items():
-            if present:
-                outcomes[f"with_{name}"] += 1
-
-        if len(samples) < 5:
-            samples.append({
-                "content_key": ck,
-                "title": row["title"],
-                "brand": row["brand"],
-                "offer_count": row["offer_count"],
-                "variants_count": row["variants_count"],
-                "primary_merchant_id": row["primary_merchant_id"],
-                **flags,
-            })
-
-        if not args.apply:
-            outcomes["rows_skipped_no_op_in_dry_run"] += 1
-            continue
-        await database.execute(UPSERT_SQL, row_to_upsert_params(row))
-        outcomes["rows_upserted"] += 1
+        # One row's failure must not lose the page: it is counted and sampled, and
+        # next_after still moves past it.
+        try:
+            await _process_key(
+                ck, args=args, refresh_source=refresh_source, outcomes=outcomes,
+                samples=samples, downgrades=downgrades,
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcomes["rows_failed"] += 1
+            if len(failures) < 20:
+                failures.append({"content_key": ck, "error": str(exc)[:200]})
+            logger.warning("backfill row failed content_key=%s: %s", ck, str(exc)[:200])
+        if sleep_s and args.apply:
+            await asyncio.sleep(sleep_s)
 
     return {
         "scope": args.scope,
@@ -253,7 +272,62 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "outcome_counts": outcomes,
         "samples": samples,
         "skipped_would_downgrade_sample": downgrades,
+        "failed_sample": failures,
+        # Keyset cursor for --scope market_prices_missing: rows this pass skipped
+        # or failed stay selected, so the next pass must start after them.
+        "next_after": content_keys[-1] if content_keys else None,
     }
+
+
+async def _process_key(
+    ck: str,
+    *,
+    args: argparse.Namespace,
+    refresh_source: str,
+    outcomes: Dict[str, int],
+    samples: List[Dict[str, Any]],
+    downgrades: List[str],
+) -> None:
+    # Assemble through the canonical read path so the evidence, enrichment
+    # and seller-trust overlays are attached. Dry-run stops here; apply
+    # persists exactly this row.
+    row = await build_agent_pdp_view_row(ck, refresh_source=refresh_source)
+    if row is None:
+        outcomes["rows_skipped_nothing_to_build"] += 1
+        return
+    outcomes["rows_assembled"] += 1
+
+    current = await database.fetch_one(_CURRENT_OVERLAY_SQL, {"ck": ck})
+    if _would_downgrade(row, dict(current) if current else None):
+        # Reported in BOTH modes, and skipped in both: a dry run that does
+        # not surface this would send an operator into --apply believing the
+        # run can only add.
+        outcomes["rows_skipped_would_downgrade"] += 1
+        if len(downgrades) < 20:
+            downgrades.append(ck)
+        return
+
+    flags = _overlay_flags(row)
+    for name, present in flags.items():
+        if present:
+            outcomes[f"with_{name}"] += 1
+
+    if len(samples) < 5:
+        samples.append({
+            "content_key": ck,
+            "title": row["title"],
+            "brand": row["brand"],
+            "offer_count": row["offer_count"],
+            "variants_count": row["variants_count"],
+            "primary_merchant_id": row["primary_merchant_id"],
+            **flags,
+        })
+
+    if not args.apply:
+        outcomes["rows_skipped_no_op_in_dry_run"] += 1
+        return
+    await execute_agent_pdp_view_upsert(database, row)
+    outcomes["rows_upserted"] += 1
 
 
 def _parse_args() -> argparse.Namespace:
@@ -263,12 +337,22 @@ def _parse_args() -> argparse.Namespace:
         help="Actually UPSERT agent_pdp_view rows. Default: dry-run.",
     )
     p.add_argument(
-        "--scope", choices=("all", "enriched"), default="all",
+        "--scope", choices=("all", "enriched", "market_prices_missing"), default="all",
         help=(
             "'all' = every content_key (default). 'enriched' = only the "
             "content_keys carrying a product_enrichment overlay — the cohort "
-            "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip."
+            "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip. "
+            "'market_prices_missing' = served rows whose market_prices is NULL "
+            "(migration 263; needs AGENT_PDP_VIEW_MARKET_PRICES=on; page with --after)."
         ),
+    )
+    p.add_argument(
+        "--after", default="",
+        help="market_prices_missing only: start after this content_key (keyset page).",
+    )
+    p.add_argument(
+        "--sleep", type=float, default=0.0,
+        help="Seconds to sleep after each row of an --apply run, to keep the primary's CPU down.",
     )
     p.add_argument(
         "--limit", type=int, default=200,

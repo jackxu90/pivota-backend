@@ -6,12 +6,12 @@ from services.retailer_ingest import detectors
 
 
 def record(title, ptype, handle, *, body="<p>A lip colour.</p>", price="20.00", vendor="3CE", variants=None,
-           brand="3CE"):
+           brand="3CE", currency="USD"):
     return feed.shopify_product_to_record(
         {"id": abs(hash(handle)) % 10**9, "vendor": vendor, "title": title, "handle": handle,
          "product_type": ptype, "body_html": body, "images": [],
          "variants": variants or [{"id": abs(hash(handle + "v")) % 10**12, "price": price, "available": True}]},
-        domain="k-touch.us", category_path="beauty", brand_override=brand, currency="USD",
+        domain="k-touch.us", category_path="beauty", brand_override=brand, currency=currency,
         source_role="retailer", retailer_name="k-touch.us", emit_native_variants=True,
     )
 
@@ -156,7 +156,7 @@ def test_a_single_unit_count_is_not_a_set():
 # headandshoulders.com priced all 120 storefront variants at 1.00 and the drain applied 74 PDPs at $1.00:
 # $1.00 clears the per-row rule. The signal is store-wide, so the rule is judged over the whole cohort.
 
-def store(prices_per_product, *, domain="headandshoulders.com"):
+def store(prices_per_product, *, domain="headandshoulders.com", currency="USD"):
     """One real-producer record per product, each carrying the given variant prices (>= 1.00: the feed
     drops a variant under MIN_SELLABLE_PRICE, so a sub-dollar row is built by `hand_record`)."""
     out = []
@@ -167,7 +167,7 @@ def store(prices_per_product, *, domain="headandshoulders.com"):
              "product_type": "Shampoo", "body_html": "<p>A shampoo.</p>", "images": [],
              "variants": [{"id": 40_000_000_000 + i * 100 + j, "price": f"{p:.2f}", "available": True,
                            "title": f"Size {j}"} for j, p in enumerate(prices)]},
-            domain=domain, category_path="beauty", brand_override="Brand", currency="USD",
+            domain=domain, category_path="beauty", brand_override="Brand", currency=currency,
             source_role="brand_official", emit_native_variants=True,
         )
         assert rec is not None and len(rec["pdp"]["variants"]) == len(prices), (prices, rec)
@@ -548,3 +548,91 @@ def test_each_corpus_verb_after_set(verb):
                                         ("Glow Set Lotion Primer", True), ("Curls Set Essence Primer", False)])
 def test_set_lotion_is_the_verb_only_after_a_hair_word(title, held):
     assert ("set_filed_as_single_product" in _flags(title, "Face Primer")) is held, title
+
+
+# --- Currency-aware placeholder bounds (2026-10-10, SG capture work: JPY base crawls of Japanese retailers) ---
+
+def _jp(title, handle, price, currency="JPY"):
+    return record(title, "Lotion", handle, body="<p>A hydrating lotion for the face.</p>", price=price,
+                  vendor="KOSE", brand="KOSE", currency=currency)
+
+
+@pytest.mark.parametrize("price,currency", [("1980", "JPY"), ("5500", "JPY"), ("29700", "JPY"),
+                                            ("25000", "KRW"), ("189000", "KRW")])
+def test_a_real_yen_or_won_price_is_not_a_placeholder(price, currency):
+    # Before: any price >= 1000 in ANY currency was placeholder_product, so nearly every JPY/KRW row held.
+    flags = detectors.detect([_jp("Sekkisei Lotion 200ml", "sekkisei-lotion", price, currency)], store_level=False)
+    assert "placeholder_product" not in rules(flags)
+
+
+@pytest.mark.parametrize("price,currency", [("999999999", "JPY"), ("40", "JPY"), ("200000000", "KRW"),
+                                            ("1000", "USD"), ("1000", ""), ("1000", "XTS")])
+def test_a_test_or_token_row_still_holds_in_its_currency(price, currency):
+    # USD, a missing currency and an unlisted one keep the dollar bounds exactly as before.
+    flags = detectors.detect([_jp("Sekkisei Lotion 200ml", "sekkisei-lotion", price, currency)], store_level=False)
+    assert "placeholder_product" in rules(flags, detectors.BLOCK)
+
+
+@pytest.mark.parametrize("currency,scale", [
+    ("JPY", 100.0), ("jpy", 100.0), ("KRW", 1000.0), ("HKD", 5.0), ("CNY", 5.0), ("TWD", 30.0), ("THB", 30.0),
+    ("PHP", 50.0), ("INR", 50.0), ("IDR", 10000.0), ("VND", 20000.0), ("MYR", 4.0), ("SEK", 10.0), ("NOK", 10.0),
+    ("DKK", 5.0), ("MXN", 15.0), ("ZAR", 15.0),
+    ("USD", 1.0), ("SGD", 1.0), ("AUD", 1.0), ("EUR", 1.0), ("GBP", 1.0), ("CAD", 1.0), (None, 1.0), ("", 1.0)])
+def test_the_magnitude_is_a_unit_not_a_rate(currency, scale):
+    assert detectors.price_magnitude(currency) == scale
+
+
+def test_a_one_yen_sample_variant_beside_a_real_price_holds_the_row():
+    # The feed's sellable floor is 1.0 in the store's currency: it drops a $0.01 promo, but keeps a 1-yen one.
+    rec = record("Sekkisei Lotion 200ml", "Lotion", "sekkisei-lotion", body="<p>A lotion for the face.</p>",
+                 vendor="KOSE", brand="KOSE", currency="JPY",
+                 variants=[{"id": 44_100_000_001, "price": "5500", "available": True, "title": "200ml"},
+                           {"id": 44_100_000_002, "price": "1", "available": True, "title": "Sample"}])
+    flags = [f for f in detectors.detect([rec], store_level=False) if f["rule"] == "placeholder_product"]
+    assert flags and flags[0]["severity"] == detectors.BLOCK
+    assert "token variant prices [1.0]" in flags[0]["detail"]  # the reviewer sees the 1-yen variant, not only 5500
+
+
+def test_a_dollar_row_is_untouched_by_the_variant_low_bound():
+    rec = record("Lip Oil", "Lip Oil", "lip-oil", variants=[
+        {"id": 44_100_000_011, "price": "38.00", "available": True, "title": "Rose"},
+        {"id": 44_100_000_012, "price": "0.01", "available": True, "title": "Promo"}])  # the feed drops the $0.01 variant
+    assert "placeholder_product" not in rules(detectors.detect([rec], store_level=False))
+
+
+def test_a_yen_store_priced_at_a_token_still_holds_store_wide():
+    # The headandshoulders.com shape in yen: every variant at 100 yen is a token, not a price list.
+    held = _held(detectors.detect(store([[100.0]] * 40, domain="example.jp", currency="JPY")))
+    assert held == {f"p{i}" for i in range(40)}
+
+
+def _yen(n, start=1980):
+    return [float(start + 110 * i) for i in range(n)]  # whole yen, as a JPY store prices
+
+
+def test_a_real_yen_store_holds_nothing():
+    flags = detectors.detect(store([[v] for v in _yen(60)], domain="example.jp", currency="JPY"))
+    assert _held(flags) == set() and "placeholder_product" not in rules(flags)
+
+
+def test_the_yen_token_path_alone_holds():
+    # 21/60 = 0.35 at <= 100 yen (the scaled 1.00 token), the rest real and varied: no mode reaches 0.80, so only
+    # the token path can hold -- it pins the scaled token price AND the scaled ceiling it appends.
+    recs = store([[100.0]] * 21 + [[v] for v in _yen(39)], domain="example.jp", currency="JPY")
+    assert _held(detectors.detect(recs)) == {f"p{i}" for i in range(21)}
+
+
+def test_the_yen_modal_path_alone_holds():
+    # 43/50 = 0.86 at 150 yen: above the 100-yen token, at or below the 200-yen modal ceiling.
+    recs = store([[150.0]] * 43 + [[v] for v in _yen(7)], domain="example.jp", currency="JPY")
+    assert _held(detectors.detect(recs)) == {f"p{i}" for i in range(43)}
+
+
+def test_a_mixed_currency_population_takes_the_largest_scale():
+    # Unreachable through the pipeline (it stops a job whose records disagree on currency), but the verdict
+    # must be deterministic and fail safe: yen tokens judged on the yen scale, whatever the set order.
+    # USD is the MAJORITY (25 of 40), so only the largest-scale rule judges the 15 yen tokens as tokens.
+    recs = (store([[v] for v in _varied(25, 30.0)], domain="example.com", currency="USD")
+            + store([[100.0]] * 15, domain="example.jp", currency="JPY"))
+    verdict = detectors.placeholder_price_store_verdict(recs)
+    assert verdict is not None and verdict["ceiling"] >= 100.0

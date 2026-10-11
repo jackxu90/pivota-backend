@@ -446,8 +446,9 @@ def test_the_capture_is_brand_stores_only(role):
 
 
 @pytest.mark.parametrize("market", ["AU", "JP"])
-def test_the_capture_writes_the_us_market_only(market):
-    with pytest.raises(ValueError, match="shopify_markets captures the US market only"):
+def test_the_capture_writes_a_served_market_only(market):
+    # US only until 2026-10-10; SG since (tests/services/test_retailer_ingest_markets_sg.py).
+    with pytest.raises(ValueError, match="shopify_markets captures the US and SG markets only"):
         pipeline.validate_options({"vendors": [BRAND], "source": "shopify_markets", "source_role": "brand_official",
                                    "market": market})
 
@@ -939,7 +940,7 @@ class SqliteCatalog:
             CREATE TABLE external_product_seeds (id text PRIMARY KEY, market text, price_currency text,
                 attached_product_key text);
         """)
-        self.republished = []
+        self.republished, self.republish_sources = [], []
 
     def load_plan(self, plan):
         for p in plan["pdps"]:
@@ -1081,8 +1082,9 @@ def two_jobs(env, monkeypatch, gates_on):  # noqa: F811
             "products": [{"product_key": p["product_key"], "canonical_url": p["canonical_url"]} for p in plan["pdps"]]}}}
     monkeypatch.setattr(pi, "require_primary_apply", require_apply)
 
-    async def republish(content_keys, *, db):
+    async def republish(content_keys, *, db, source_system=markets.SOURCE_SYSTEM):
         catalog.republished.extend(content_keys)
+        catalog.republish_sources.append(source_system)
         return []
     monkeypatch.setattr(markets, "republish", republish)
     store = Store()
