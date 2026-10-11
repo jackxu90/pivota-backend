@@ -372,12 +372,29 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
 # exceed 3600s.
+# COVERAGE + THROUGHPUT (2026-10-11, Peng: "make sure main route works"). The similar rails are moving
+# to relationship-graph-only (PIVOTA-Agent #2409), so the nightly run must GROW coverage, not follow
+# ingest churn: on 2026-10-09 its 250 reviews went to whatever catalog rows changed in 24h (KISS
+# press-ons, Stila, OPI), and 2,550 of ~18,000 products had a served alternative after a one-off
+# backlog drain. Prod only:
+#   RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true  - build for live anchors with no served alternative first
+#     (PIVOTA-Agent #2336; cooldown 7 days by default). PREREQUISITE: migration
+#     061_relationship_graph_anchor_attempts applied in prod, and an image containing #2336 (0ef182dcd).
+#   RELGRAPH_SYNC_REVIEW_LIMIT=1000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=6 - the 2026-10-10 drain measured
+#     1,000 reviews at concurrency 6 in ~27 minutes (2.1-4.1% errors); with the ~8 minute build that is
+#     well inside the step budget, which rises to 90 minutes. The anchor caps (RELGRAPH_SYNC_LIMIT 200,
+#     SELECT_LIMIT 250) stay at the image defaults until a night at these values is measured.
+# Staging keeps the 45-minute budget and none of these. --set-env-vars replaces the whole env, so the
+# live job must carry exactly these values before the next reconcile (set them with the same update).
 # Staging gets neither Vertex nor the write gates: GOOGLE_CLOUD_PROJECT follows $PROJECT, and the
 # gates follow RELGRAPH_SYNC_WRITES (validated above; never true in staging).
 relgraph_sync_env(){
-  local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
+  local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
   if [ "$ENV" = prod ]; then
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,RELGRAPH_SYNC_REVIEW_LIMIT=1000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=6,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
     env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
+  else
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
   fi
   if [ "$RELGRAPH_SYNC_WRITES" = true ]; then
     env="$env,RELGRAPH_SYNC_APPLY_BUILD=true,RELGRAPH_SYNC_APPLY_REVIEW=true,RELGRAPH_SYNC_ALLOW_WRITES=true,RELGRAPH_SYNC_CONFIRM=APPLY_RELGRAPH_SYNC_ROUTINE"
