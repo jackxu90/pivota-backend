@@ -182,8 +182,9 @@ def test_the_map_covers_the_measured_production_cohort():
     """117 distinct off-taxonomy paths were measured on prod 2026-09-09. Each is either aliased or
     declared a gap; a path in neither would be silently left broken by a map that claims to have
     considered it. The counts are pinned so that trimming the map is a visible decision."""
-    assert len(ALIASES) == 87, "alias count changed; re-measure before editing the expectation"
-    assert len(TAXONOMY_GAPS) == 29
+    assert len(ALIASES) == 88, "alias count changed; re-measure before editing the expectation"
+    assert len(TAXONOMY_GAPS) == 28
+    # 2026-10-10: the `makeup/setting-spray` gap became an ALIAS of the new setting-spray leaf.
     # 2026-09-26: the three nail gaps became LEAVES (not dropped), and the `eyes/lashes` gap became
     # an ALIAS of the new false-lash leaf, together with two spellings measured since 09-09
     # (`eyes/false-lashes`, `eyes/false_lashes`) -- so 117 measured + 2 new sources.

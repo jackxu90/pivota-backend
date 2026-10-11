@@ -1876,7 +1876,21 @@ _TYPE_FAMILIES = {
 _AMBIGUOUS_PRODUCT_TYPE_KEYS = frozenset({"lipglossoil", "lipglossliptint"})
 
 
+# A setting spray is sprayed over the face. Measured 2026-10-10 on holiholic.com's "Setting Spray" shelf:
+# it also holds Etude's "Dr. Mascara Fixer", "Bare Edge Brow Fixer", "Pang Pang Haircara Fixer" and
+# A'PIEU's "Pro Curling The Black Fixer Mascara" -- fixers for lashes, brows and hair, not for a face.
+_SETTING_SPRAY_LEAF = "beauty/makeup/face/setting-spray"
+_SETTING_SPRAY_OTHER_AREA = re.compile(r"\b(?:mascaras?|(?:eye)?lash(?:es)?|(?:eye)?brows?|hair\w*|haircara)\b", re.I)
+# A shelf that names two products by design: the title picks which one THIS product is, and only when it
+# names exactly one of them and nothing else. credobeauty.com ("makeup, face, setting spray & powder") and
+# unitedbeautysupply.com ("Setting Spray and Powder") shelve both; until setting spray had a leaf, the
+# type read as powder alone and filed the sprays on it.
+_COMBINED_SHELF_LEAVES = (frozenset({_SETTING_SPRAY_LEAF, "beauty/makeup/face/powder"}),)
+
+
 def _title_contradicts_product_type(title: Optional[str], path: str) -> bool:
+    if path == _SETTING_SPRAY_LEAF and _SETTING_SPRAY_OTHER_AREA.search(str(title or "")):
+        return True
     claimed = _TYPE_FAMILIES.get(path)
     if not claimed:
         return False
@@ -2526,6 +2540,10 @@ def _resolve_category_by_evidence(*, product_type: Optional[str], title: Optiona
                 and all(path.startswith("beauty/makeup/") and not path.startswith("beauty/makeup/nails/")
                         for path in type_uses)):
             return accept("beauty/tools/brush", CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+        shelf = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(product_type or ""))}
+        named = _title_paths(title)
+        if shelf in _COMBINED_SHELF_LEAVES and len(named) == 1 and named <= shelf:
+            return accept(next(iter(named)), CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
         return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
     if ptype in _GENERIC_LIP_TYPES:
         title_hit = classify(title)

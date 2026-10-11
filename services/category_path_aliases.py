@@ -169,6 +169,9 @@ _alias("beauty/makeup/eye/mascara", "beauty/makeup/eyes/lash")
 _alias("beauty/makeup/eye/false-lashes", "beauty/makeup/eyes/lashes", "beauty/makeup/eyes/false-lashes",
        "beauty/makeup/eyes/false_lashes")
 _alias("beauty/makeup/face/foundation", "beauty/makeup/base")
+# Setting spray got a leaf on 2026-10-10. `makeup/setting-spray` was a declared gap ("no setting-spray
+# leaf"); 2 live rows held it that day. It is the 3-segment spelling of the one leaf.
+_alias("beauty/makeup/face/setting-spray", "beauty/makeup/setting-spray")
 _alias("beauty/tools/sponge", "beauty/makeup/tools/sponge")
 
 # BODY. FOUR spellings of the same shelf — `body-care`, `bodycare`, `skincare/body`,
@@ -284,7 +287,6 @@ TAXONOMY_GAPS: Dict[str, str] = {
     "beauty/men/beard/oil": "no men's-grooming leaf",
     "beauty/spa/body_treatment": "a SERVICE, not a product",
     "beauty/aromatherapy/pen": "no aromatherapy leaf",
-    "beauty/makeup/setting-spray": "no setting-spray leaf; face/powder is a different product",
     "beauty/skincare/tools": "tools/* are brushes and sponges only",
     "beauty/skincare/tools/gua-sha": "tools/* are brushes and sponges only",
     "beauty/skincare/tools/exfoliator": "tools/* are brushes and sponges only",

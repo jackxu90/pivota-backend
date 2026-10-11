@@ -273,6 +273,22 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         # ...and "No-Wipe Top Coat" names no wipe at all.
         r"(?<!polish\sremover\s)(?<!nail\sremover\s)(?<!gel\sremover\s)(?<!no-)(?<!no\s)wipes?|wash)\b",
         re.IGNORECASE)),
+    # A SETTING SPRAY is makeup, sprayed over a finished face to hold it -- not a toner, although
+    # most are sold as a "mist". It was a declared gap (`beauty/makeup/setting-spray`, "no
+    # setting-spray leaf") until 2026-10-10. Measured that day: ~72 drain products on 28 domains
+    # left out as category_unresolved, and 23 live rows coarse or misfiled -- 6 of them on the toner
+    # leaf through the bare "mist" below ("Makeup Fixing Mist", "You Mist ... Setting Spray").
+    # Four segments under face/, so recall's `beauty/makeup/face/` door already reaches it.
+    # Only the phrases that NAME the product: a bare "finishing spray" is a hair spray as often as
+    # not ("Volumizing Finishing Spray", "Finishing Hairspray"), a bare "fixer" is unread, and
+    # "makeup setting" alone names puffs as often as sprays ("Makeup Setting Puffs").
+    # ABOVE Toner (and above the acid-pad arm, which must sit directly on Toner), and Toner declines
+    # the same phrases, so a merchant type "Setting Mist" or "Mist & Fix" is one match in
+    # services/curated_brand_feed._pattern_matches, not two.
+    ("Setting Spray", "beauty/makeup/face/setting-spray", re.compile(
+        r"\b(setting\s+(?:spray|mist)s?|fix(?:er|ing)?\s+(?:spray|mist)s?|mist\s*(?:&|and|\+)\s*fix|"
+        r"make[\s-]?up\s+(?:setting\s+)?fix(?:er|ing)s?|setting\s+fixers?)\b",
+        re.IGNORECASE)),
     # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
     #
     # 1. INDUSTRY STANDARD. Google Product Taxonomy 5976 and Shopify's standard taxonomy
@@ -321,7 +337,8 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
         r"|\b(?:peel(?:ing)?|exfoliating|exfoliant)(?:-|[^\S\n\r])+pads?\b)",
         re.IGNORECASE)),
     ("Toner", "beauty/skincare/tone/toner", re.compile(
-        r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)),
+        r"\b(toner|tonic|(?<!setting\s)(?<!fix\s)(?<!fixer\s)(?<!fixing\s)mist(?!\s*(?:&|and|\+)\s*fix)|"
+        r"pad|skin booster)\b", re.IGNORECASE)),
     # An acne / blemish patch is a TREATMENT, not a mask. Google Product Taxonomy 5976 and Shopify
     # both file it under Acne Treatments, and the measured curated shelves (eyurs "Acne Pimple
     # Patch", sokoglam "Spot") map it to treat/treatment -- so while these phrases sat in the Mask
