@@ -1827,7 +1827,13 @@ async def execute_agent_pdp_view_upsert(db: Any, row: Dict[str, Any]) -> None:
     """Write an assembled row. The summary is written only when the columns exist;
     otherwise -- the heal not run yet -- the row is written exactly as with the
     flag off, so the legacy prices keep refreshing instead of every refresh
-    failing on the missing column."""
+    failing on the missing column.
+
+    Inside a caller's transaction the missing-column retry cannot recover: the
+    failed statement has already aborted the transaction, so the legacy retry
+    raises InFailedSQLTransactionError -- loudly, never masked. Only a column
+    dropped AFTER a positive probe gets there (review of #2556, 2026-10-11); the
+    absent-column case is decided by the probe before any statement runs."""
     if "market_prices" in row and not await agent_pdp_view_has_market_prices(db):
         row = {k: v for k, v in row.items() if k != "market_prices"}
     try:
